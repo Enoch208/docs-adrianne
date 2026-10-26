@@ -1,72 +1,163 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Selo",
+  "description": "CI for x402. Selo pays your endpoint before your users do.",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#EA580C",
+    "light": "#FB923C",
+    "dark": "#C2410C"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/favicon.png",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg",
+    "href": "https://useselo.xyz"
+  },
   "navigation": {
-    "pages": [
+    "tabs": [
       {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
+        "tab": "Documentation",
+        "icon": "book-open",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": ["index", "quickstart", "how-it-works", "agents"]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/authorize-endpoint",
+              "guides/preflight",
+              "guides/release-contract",
+              "guides/run-release-test",
+              "guides/github-actions",
+              "guides/verify-attestation",
+              "guides/resume",
+              "guides/any-x402-client",
+              "guides/demo-merchant"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/checks",
+              "concepts/verdicts",
+              "concepts/payments",
+              "concepts/authorization",
+              "concepts/attestations",
+              "concepts/security",
+              "concepts/reconciliation"
+            ]
+          },
+          {
+            "group": "Resources",
+            "pages": [
+              "resources/pricing-and-limits",
+              "resources/mainnet-proof",
+              "resources/faq",
+              "resources/limitations",
+              "resources/changelog"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI reference",
+        "icon": "terminal",
+        "groups": [
+          {
+            "group": "selo CLI",
+            "pages": ["cli/overview", "cli/auth", "cli/preflight", "cli/test", "cli/verify", "cli/files"]
+          },
+          {
+            "group": "CI",
+            "pages": ["cli/github-action"]
+          }
+        ]
+      },
+      {
+        "tab": "API reference",
+        "icon": "code",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["api-reference/introduction", "api-reference/errors", "api-reference/objects"]
+          },
+          {
+            "group": "Endpoints",
+            "openapi": "openapi.json",
+            "pages": [
+              "POST /v1/authorizations",
+              "POST /v1/authorizations/{authorizationId}/verify",
+              "GET /v1/authorizations/{authorizationId}",
+              "POST /v1/preflight",
+              "GET /v1/preflight/{preflightId}",
+              "POST /v1/release-test",
+              "GET /v1/reports/{token}",
+              "GET /.well-known/selo-attestation-keys.json",
+              "GET /llms.txt",
+              "GET /.well-known/agent-card.json",
+              "GET /health"
+            ]
+          }
         ]
       }
     ],
     "global": {
       "anchors": [
         {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
+          "anchor": "Website",
+          "href": "https://useselo.xyz",
+          "icon": "globe"
         },
         {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
+          "anchor": "GitHub",
+          "href": "https://github.com/Enoch208/selo",
+          "icon": "github"
+        },
+        {
+          "anchor": "Pilot guide",
+          "href": "https://github.com/Enoch208/selo/blob/main/docs/PILOT_GUIDE.md",
+          "icon": "flag-checkered"
         }
       ]
     }
   },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+  "api": {
+    "playground": {
+      "display": "simple"
+    },
+    "examples": {
+      "languages": ["curl", "javascript", "python"]
+    }
   },
   "navbar": {
     "links": [
       {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
+        "label": "GitHub",
+        "href": "https://github.com/Enoch208/selo"
       }
     ],
     "primary": {
       "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "label": "Open Selo",
+      "href": "https://useselo.xyz"
     }
   },
   "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
+    "options": ["copy", "view", "chatgpt", "claude", "perplexity", "mcp", "cursor", "vscode"]
+  },
+  "seo": {
+    "metatags": {
+      "og:site_name": "Selo docs"
+    }
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "x": "https://x.com/useselo_",
+      "github": "https://github.com/Enoch208/selo",
+      "website": "https://useselo.xyz"
     }
   }
 }
