@@ -1,0 +1,281 @@
+---
+title: "Try it with the demo merchant"
+description: "Run Selo's demo x402 merchant on your own domain and reproduce a healthy release that Selo fails, then the fix it passes."
+icon: "store"
+sidebarTitle: "Demo merchant"
+---
+
+The demo merchant is a small x402 endpoint in the Selo repository, at `examples/merchant`. It sells one demo order for 0.01 USDC on Algorand behind the stock `@x402/hono` payment middleware, and it ships two releases at the same URL. Both are healthy and both settle payments. Only one keeps its promise to paying clients, and only a paid request against the release contract tells them apart.
+
+## The two releases
+
+| Release | `GET /health` | Unpaid `POST /v1/orders` | Paid `POST /v1/orders` |
+| --- | --- | --- | --- |
+| `broken-v1` | `200` | `402` with a valid challenge | `200` and settles, but the receipt field is named `receipt_id` |
+| `fixed-v2` | `200` | `402` with a valid challenge | `200` and settles, with the declared `receiptId` |
+
+`broken-v1` models a serializer change that renamed one field. The endpoint is up, the payment settles and the status is `200`, yet every client that reads `receiptId` breaks.
+
+<CodeGroup>
+```json broken-v1
+{
+  "orderId": "ord_<24 hex characters>",
+  "receipt_id": "rcpt_<24 hex characters>",
+  "sku": "demo-widget",
+  "quantity": 1,
+  "fulfilled": true,
+  "release": "broken-v1"
+}
+```
+
+```json fixed-v2
+{
+  "orderId": "ord_<24 hex characters>",
+  "receiptId": "rcpt_<24 hex characters>",
+  "sku": "demo-widget",
+  "quantity": 1,
+  "fulfilled": true,
+  "release": "fixed-v2"
+}
+```
+</CodeGroup>
+
+Both ids are derived from the SHA-256 of the signed payment, so one payment always yields the same order and receipt. When Selo replays the identical payment, the facilitator refuses to settle it twice, and the merchant answers the replay with `402`.
+
+The release contract in `examples/merchant/contract.json` requires `orderId`, `receiptId` and `fulfilled: true`:
+
+```json contract.json
+{
+  "status": 200,
+  "contentType": "application/json",
+  "jsonSchema": {
+    "type": "object",
+    "required": ["orderId", "receiptId", "fulfilled"],
+    "properties": {
+      "orderId": { "type": "string", "pattern": "^ord_[0-9a-f]{24}$" },
+      "receiptId": { "type": "string", "pattern": "^rcpt_[0-9a-f]{24}$" },
+      "fulfilled": { "const": true }
+    }
+  }
+}
+```
+
+The request body Selo sends is `examples/merchant/order.json`: `{ "sku": "demo-widget", "quantity": 1 }`. The merchant accepts a `sku` of 1 to 40 lowercase letters, digits or dashes, and a `quantity` from 1 to 10.
+
+## Prerequisites
+
+- A checkout of the Selo repository, Node 24 and pnpm 10, with `pnpm install --frozen-lockfile`.
+- For a real release test: a server with a public HTTPS domain, and a payee address on Algorand Mainnet opted in to USDC (ASA `31566704`). The merchant only receives payments, so it needs the address, never a key.
+- For the paid runs: a payer wallet for `selo test` holding 1.00 USDC per run. See [Run a release test](/guides/run-release-test).
+
+## Run it locally
+
+Locally, the merchant is useful to see its 402 and its behaviour. Selo cannot test it there, because Selo only calls public HTTPS endpoints.
+
+<Steps>
+  <Step title="Start the merchant">
+    ```bash Terminal
+    MERCHANT_RELEASE=broken-v1 \
+    MERCHANT_NETWORK=algorand-testnet \
+    MERCHANT_PAY_TO=<your Algorand address, opted in to USDC> \
+    MERCHANT_PUBLIC_ORIGIN=http://localhost:8792 \
+    PORT=8792 \
+    pnpm --filter @selo/example-merchant start
+    ```
+
+    ```text Output
+    demo merchant broken-v1 on algorand-testnet: http://localhost:8792/v1/orders (listening on 127.0.0.1:8792)
+    ```
+  </Step>
+  <Step title="Check its health">
+    ```bash Terminal
+    curl -s localhost:8792/health
+    ```
+
+    ```json Output
+    {"status":"ok","release":"broken-v1"}
+    ```
+  </Step>
+  <Step title="Ask for an order without paying">
+    ```bash Terminal
+    curl -s -i -X POST localhost:8792/v1/orders \
+      -H 'content-type: application/json' -d @examples/merchant/order.json
+    ```
+
+    The merchant answers `402 Payment Required` with an empty JSON body and the challenge in the `PAYMENT-REQUIRED` header. Decoded, its requirement on Testnet is:
+
+    ```json accepts[0]
+    {
+      "scheme": "exact",
+      "network": "algorand:SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI=",
+      "amount": "10000",
+      "asset": "10458941",
+      "payTo": "<your Algorand address>",
+      "maxTimeoutSeconds": 120,
+      "extra": {
+        "name": "USDC",
+        "decimals": 6,
+        "feePayer": "ZMFK2OI7ZBD2U27ISERZC4S6LKM6WMFJPZQ4MYNJDZ2VNBNMBA67RA22AA"
+      }
+    }
+    ```
+
+    `10000` atomic units is 0.01 USDC. The challenge also declares a Bazaar `extensions.bazaar` block with the order input, an example receipt and the receipt schema. On `algorand-mainnet`, the network is `algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=` and the asset is `31566704`.
+  </Step>
+  <Step title="Run its tests">
+    The merchant's own tests run both releases against a fake facilitator, with no wallet and no network:
+
+    ```bash Terminal
+    pnpm test --project merchant
+    ```
+
+    They check that both releases pass an ordinary health check, answer an unpaid request with the same challenge, and settle; that `broken-v1`'s paid body fails the contract and `fixed-v2`'s matches it; that one payment yields one receipt; and that `contract.json` equals the receipt schema the merchant advertises.
+  </Step>
+</Steps>
+
+## Configuration
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `MERCHANT_RELEASE` | yes | `broken-v1` or `fixed-v2` |
+| `MERCHANT_NETWORK` | yes | `algorand-testnet` or `algorand-mainnet` |
+| `MERCHANT_PAY_TO` | yes | The payee address. It must be opted in to USDC on that network |
+| `MERCHANT_PUBLIC_ORIGIN` | yes | The public origin clients use, such as `https://shop.example.com`. `https`, or `http` only for `localhost`. It becomes the resource URL in the 402 |
+| `SELO_VERIFICATION_FILE` | no | Path to a file served at `/.well-known/selo-verification.txt`. It is read on every request, up to 4096 bytes. Without it, that path answers `404` |
+| `FACILITATOR_URL` | no | Defaults to `https://facilitator.goplausible.xyz` |
+| `PORT` | no | Defaults to `8791` |
+| `HOST` | no | Defaults to `127.0.0.1` |
+
+The environment is validated at startup, and the merchant refuses to start with a missing or invalid value.
+
+## Deploy it on your own domain
+
+<Steps>
+  <Step title="Prepare a payee address">
+    Use an Algorand Mainnet address you control, opted in to USDC (ASA `31566704`). Each paid release test pays it 0.01 USDC from Selo's wallet.
+  </Step>
+  <Step title="Start the broken release on Mainnet">
+    On your server, from the checkout:
+
+    ```bash Terminal
+    MERCHANT_RELEASE=broken-v1 \
+    MERCHANT_NETWORK=algorand-mainnet \
+    MERCHANT_PAY_TO=<your payee address> \
+    MERCHANT_PUBLIC_ORIGIN=https://shop.example.com \
+    SELO_VERIFICATION_FILE=/srv/merchant/selo-verification.txt \
+    PORT=8791 \
+    pnpm --filter @selo/example-merchant start
+    ```
+
+    Keep it running under your process manager, and put it behind a reverse proxy that terminates TLS for your domain, for example nginx with a Let's Encrypt certificate, forwarding to `127.0.0.1:8791`. Set `MERCHANT_PUBLIC_ORIGIN` to exactly the origin clients use.
+  </Step>
+  <Step title="Check it from outside">
+    ```bash Terminal
+    curl -s https://shop.example.com/health
+    curl -s -o /dev/null -w '%{http_code}\n' -X POST https://shop.example.com/v1/orders \
+      -H 'content-type: application/json' -d @examples/merchant/order.json
+    ```
+
+    Expect `{"status":"ok","release":"broken-v1"}` and `402`.
+  </Step>
+  <Step title="Describe it as yours">
+    The 402 and the Bazaar listing carry the description in `merchantDescription` in `examples/merchant/src/app.ts`, which names Selo's own demo. Edit it so your listing describes your deployment.
+  </Step>
+</Steps>
+
+## Reproduce FAIL, fix, PASS
+
+Two paid runs cost 2.00 USDC from your payer wallet to Selo. Selo pays your merchant 0.01 USDC per run from its own wallet.
+
+<Steps>
+  <Step title="Authorize the route">
+    ```bash Terminal
+    API=https://api.useselo.xyz
+    URL=https://shop.example.com/v1/orders
+    PAYTO=N37HMJCB4BAITC2ZU7C4XW7PUMCO4T3TUASHQEL6A4EWMLOTTHOB7IOOKY
+
+    pnpm selo auth create --api $API --url $URL --method POST --project demo-merchant --contact you@example.com
+    ```
+
+    Write the printed `selo-verification=…` line to the file named by `SELO_VERIFICATION_FILE`. The merchant reads it per request, so no restart is needed. Then:
+
+    ```bash Terminal
+    pnpm selo auth verify --api $API --authorization auth_…
+    ```
+  </Step>
+  <Step title="Preflight for free">
+    ```bash Terminal
+    pnpm selo preflight --api $API --authorization auth_… --url $URL --method POST \
+      --body examples/merchant/order.json
+    ```
+
+    Expect `target fee 0.01 USDC, paid by Selo` and `you pay 1.00 USDC to Selo for the release test`.
+  </Step>
+  <Step title="Test the broken release">
+    ```bash Terminal
+    pnpm selo test --api $API --authorization auth_… --url $URL --method POST \
+      --body examples/merchant/order.json --contract examples/merchant/contract.json \
+      --release broken-v1 --network mainnet --max-usdc 1.00 --approve-mainnet --pay-to $PAYTO \
+      --summary broken-v1.json --attestation broken-v1-attestation.json
+    echo $?
+    ```
+
+    Expect `response_contract` FAIL `SCHEMA_MISMATCH`, then `gate BLOCK (exit 1): FAIL: response_contract`, and exit `1`.
+  </Step>
+  <Step title="Ship the fix">
+    Restart the merchant with `MERCHANT_RELEASE=fixed-v2`, then check:
+
+    ```bash Terminal
+    curl -s https://shop.example.com/health
+    ```
+
+    ```json Output
+    {"status":"ok","release":"fixed-v2"}
+    ```
+  </Step>
+  <Step title="Test the fixed release">
+    Run the same `selo test` command with `--release fixed-v2`, `--summary fixed-v2.json` and `--attestation fixed-v2-attestation.json`. Expect every check to pass, then `gate ALLOW (exit 0): PASS on every release check`, and exit `0`.
+  </Step>
+  <Step title="Verify both verdicts offline">
+    ```bash Terminal
+    pnpm selo verify --attestation broken-v1-attestation.json \
+      --keys https://api.useselo.xyz/.well-known/selo-attestation-keys.json \
+      --release broken-v1 --url $URL --method POST
+    pnpm selo verify --attestation fixed-v2-attestation.json \
+      --keys https://api.useselo.xyz/.well-known/selo-attestation-keys.json \
+      --release fixed-v2 --url $URL --method POST
+    ```
+
+    The first exits `1` with verdict FAIL, the second `0` with verdict PASS. Presenting the `fixed-v2` attestation for `broken-v1` exits `2`. See [Verify a signed verdict](/guides/verify-attestation).
+  </Step>
+</Steps>
+
+<Note>
+  The discovery check compares your live 402 with your route's Bazaar listing. On a fresh deployment the route may not be listed yet, and `discovery_contract` reports WARN `NOT_CATALOGED`: a warning that does not block a PASS. If Selo cannot read the catalog at all, the check is INCONCLUSIVE `CATALOG_UNAVAILABLE`, and so is the verdict, unless another check proved a FAIL. INCONCLUSIVE is never a PASS: retry later.
+</Note>
+
+## The recorded Mainnet runs
+
+The public instance at `https://demo.useselo.xyz/v1/orders` is the one Selo tested on Algorand Mainnet on 26 October 2026, through the same CLI commands. Its health check answered `200` on both releases.
+
+| | `broken-v1` | `fixed-v2` |
+| --- | --- | --- |
+| Verdict | **FAIL** | **PASS** |
+| Checks | `response_contract` FAIL `SCHEMA_MISMATCH`; handshake, paid delivery and retry safety PASS; discovery INCONCLUSIVE `CATALOG_UNAVAILABLE` | All five PASS |
+| CLI | exit `1`, gate BLOCK | exit `0`, gate ALLOW |
+| Job | `job_189NZ481HFH77CRGF60AEF22RG` | `job_51AZ2WJZ78RF1WZC316Q1K38GG` |
+| Selo was paid, 1.00 USDC | [`SVGTX3U6…YVIEQ`](https://allo.info/tx/SVGTX3U6XQLSGJP7L7X7KNPSDLWFBSA3JK7AFNHPWENIWP4YVIEQ) | [`EPBEZR22…UIJA`](https://allo.info/tx/EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA) |
+| Selo paid the merchant, 0.01 USDC | [`RZR6XUIA…DOLQ`](https://allo.info/tx/RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ) | [`QEUF5D33…E3ZQ`](https://allo.info/tx/QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ) |
+
+You cannot run a paid test against that instance yourself: an authorization needs a line served from its origin, which only its operator can publish. Deploy your own copy to reproduce the runs. See [Proof on Algorand Mainnet](/resources/mainnet-proof) for the full record.
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| The merchant exits at startup with a validation error | A variable is missing or invalid, for example a `MERCHANT_PAY_TO` that is not an Algorand address, or an `http` origin that is not `localhost` | Fix the variable named in the error |
+| `/.well-known/selo-verification.txt` answers `404` | `SELO_VERIFICATION_FILE` is unset or points at a missing file | Set it and write the printed line to that path |
+| `selo auth verify` fails with `VERIFICATION_FAILED` | The line in the file does not match, or your proxy does not forward `/.well-known/` | Check `curl https://shop.example.com/.well-known/selo-verification.txt` |
+| Preflight is `NETWORK_NOT_SUPPORTED` | The merchant runs with `MERCHANT_NETWORK=algorand-testnet` | The public API pays on Mainnet. Use `algorand-mainnet` |
+| Preflight is `TARGET_ADDRESS_BLOCKED` or `TARGET_UNREACHABLE` | The domain is not public, not on port 443, or not reachable | Serve the merchant on a public HTTPS domain |
+| A paid POST answers `400 INVALID_ORDER` | The order body is not a `sku` and a `quantity` within the limits above | Send `examples/merchant/order.json` |

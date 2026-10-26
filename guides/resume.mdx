@@ -1,0 +1,164 @@
+---
+title: "Recover an interrupted run"
+description: "Fetch the result of a paid run whose outcome you never saw, without paying a second time."
+icon: "clock-rotate-left"
+---
+
+A paid request can be interrupted after your payment left: the connection drops, a proxy times out, or Selo holds a settlement it could not confirm. The `selo` CLI never guesses. It records the attempt, refuses to pay again for that release, and lets you fetch the result with `--resume`, which reuses the same preflight and `Idempotency-Key` so Selo never settles a second time.
+
+## The run state file
+
+Before it sends the paid request, `selo test` writes the attempt to `.selo/runs/<release>.json`, relative to the directory you ran `pnpm selo` in. It writes the file again with the outcome. The directory is created with mode `700` and the file with mode `600`, and each write replaces the file atomically.
+
+```json .selo/runs/<release>.json
+{
+  "schema": "selo.cli.run.v1",
+  "release": "<your release id>",
+  "api": "https://api.useselo.xyz",
+  "target": { "url": "https://api.example.com/v1/orders", "method": "POST" },
+  "network": "algorand-mainnet",
+  "payer": "<your payer address>",
+  "preflightId": "pfl_…",
+  "idempotencyKey": "selo-cli-<48 hex characters>",
+  "phase": "unresolved",
+  "message": "<why the run stopped>",
+  "expectedInboundTxId": "<the id of the transaction you signed>",
+  "jobId": null,
+  "verdict": null,
+  "reportUrl": null,
+  "updatedAt": "<ISO 8601>"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | Always `selo.cli.run.v1` |
+| `release` | The `--release` id. The file is keyed by it |
+| `api`, `target`, `network`, `payer` | What the run paid for and from which wallet. A resume must match them |
+| `preflightId` | The preflight the paid request named |
+| `idempotencyKey` | `selo-cli-` followed by 48 hex characters of a SHA-256 of the preflight id and the payer address |
+| `phase` | Where the run stands. See below |
+| `message` | The reason the CLI gave |
+| `expectedInboundTxId` | The id of the payment transaction you signed, known before it was sent, or `null` if the run stopped before signing |
+| `jobId`, `verdict`, `reportUrl` | Filled in once a report arrives. `reportUrl` is the full private report link |
+| `updatedAt` | When the file was last written |
+
+<Warning>
+  The run state holds the private report link. Never commit or upload `.selo/`. Add it to your `.gitignore`.
+</Warning>
+
+## Phases
+
+| Phase | Meaning | Blocks a new paid run for this release |
+| --- | --- | --- |
+| `paying` | The paid request was about to be sent, and no outcome was recorded. The CLI stopped in between | Yes |
+| `unresolved` | The payment may have settled, but the CLI did not get a usable answer | Yes |
+| `rejected` | Selo or the CLI refused the payment before it could be charged | No |
+| `concluded` | Selo answered `200` with its result, or said the job finished without a report | No |
+
+While the phase is `paying` or `unresolved`, every new `selo test` for that release stops before the preflight, exits `2` and prints how to recover:
+
+```text Output
+release <release> has an unconfirmed paid run (unresolved): <message>
+Do not start a new paid run for this release; that could pay a second time.
+Resume it instead: rerun the same selo test command with --resume. It reuses the same preflight and Idempotency-Key, and Selo never settles a duplicate.
+Check the payer account for transaction <expectedInboundTxId> on an Algorand explorer.
+Run state: <your directory>/.selo/runs/<release>.json
+```
+
+A file that cannot be read or parsed also stops the run with exit `2`: `the run state … is unreadable; inspect it before paying again`.
+
+## What leaves a run unresolved
+
+| What happened | Message | Exit |
+| --- | --- | --- |
+| The paid request failed in transit | `paid request failed in transit (…); it may have settled. Check the payer account on chain for <txId>; do not pay again blindly.` | 2 |
+| Selo's API redirected the paid request | `paid request: target redirected (…); nothing further sent. The signed payment reached … only; it may have settled. …` | 2 |
+| Selo answered `5xx`, for example `502 INBOUND_SETTLEMENT_UNRESOLVED` when the facilitator did not confirm your settlement | `the payment outcome is not confirmed; do not pay again blindly: HTTP 502 …` | 2 |
+| The job was still running | `the release test is still running; resume later: HTTP 409 JOB_IN_PROGRESS: …` | 2 |
+| The CLI crashed after the paid request was sent | `… after the paid request was sent; it may have settled. …` | 2 |
+
+When Selo holds an inbound settlement it could not confirm, it never runs the job and it tells the client not to pay again. A retry of the same request is answered from the held job, without settling again.
+
+## Resume a run
+
+<Steps>
+  <Step title="Look at the payment on chain">
+    Open `https://allo.info/tx/<expectedInboundTxId>`, or check the payer account on any Algorand explorer. If the transaction is there, Selo was paid.
+  </Step>
+  <Step title="Rerun the same command with --resume">
+    Use the same `--api`, `--url`, `--method`, `--network` and payer wallet as the run you resume. Pass every other flag as before.
+
+    ```bash Terminal
+    pnpm selo test \
+      --api https://api.useselo.xyz \
+      --authorization auth_… \
+      --url https://api.example.com/v1/orders --method POST \
+      --body body.json --contract contract.json \
+      --release <your release id> \
+      --network mainnet --max-usdc 1.00 \
+      --approve-mainnet --pay-to N37HMJCB4BAITC2ZU7C4XW7PUMCO4T3TUASHQEL6A4EWMLOTTHOB7IOOKY \
+      --summary selo-gate.json --attestation selo-attestation.json \
+      --resume
+    ```
+  </Step>
+  <Step title="Read the result">
+    When the job has a report, the output is the same as a normal run: the checks, both transaction ids, the gate and the exit code. The run state moves to `concluded`.
+  </Step>
+</Steps>
+
+## Why a resume cannot charge you twice
+
+A resume does not run a new preflight. It reads `preflightId` and `idempotencyKey` from the run state and sends the paid request again with the same key. Selo's 402 still requires a payment on that request, so the CLI signs one, but Selo uses the key only to find the job:
+
+1. Selo verifies the payment with the facilitator. Verifying does not move funds.
+2. Selo claims the job by the preflight id and the `Idempotency-Key`. The original request already claimed it, so this is a duplicate.
+3. For a duplicate, Selo answers from the existing job and never settles the new payment: the report if it is written, `409 JOB_IN_PROGRESS` if it is still running, `409 JOB_TERMINAL` if it ended without a report, or `502 INBOUND_SETTLEMENT_UNRESOLVED` if its settlement is held.
+
+Selo's own test suite covers this: "A21: the same Idempotency-Key with two different payments settles once", and in the CLI, "recovers an interrupted paid call by resuming, settling only once".
+
+A new run without `--resume` would take a new preflight, derive a new key and be a new paid test. That is why the CLI refuses it while an outcome is unconfirmed.
+
+## What a resume can answer
+
+| Selo answers | Phase after | Exit |
+| --- | --- | --- |
+| `200` with a report | `concluded` | `0`, `1` or `2`, from the verdict |
+| `409 JOB_IN_PROGRESS` | `unresolved` | `2`. Resume again later |
+| `409 JOB_TERMINAL` | `concluded` | `2`. The job finished without a report |
+| `5xx`, including `502 INBOUND_SETTLEMENT_UNRESOLVED` | `unresolved` | `2` |
+| `402` | `unresolved` | `3`. Selo did not accept the new payment |
+| Any other `4xx`, or a refused unpaid request | `unresolved` | `2` |
+
+## Refusals
+
+| Message | Exit | Why |
+| --- | --- | --- |
+| `nothing to resume: no earlier run is recorded for release <release>` | 3 | There is no run state for this release in this directory |
+| `--resume must use the same --api, --url, --method, --network and payer as the run it resumes` | 3 | The command or the wallet differs from the recorded run |
+| `the last run for release <release> is already <phase>: <message>` | 3 | The run is `rejected` or `concluded`. Nothing needs resuming; a new run without `--resume` starts a new paid test |
+
+## Limits
+
+<AccordionGroup>
+  <Accordion title="Resume within 15 minutes">
+    Selo checks the preflight before anything else on the paid route, and a preflight is valid for 15 minutes. After that, the unpaid request of a resume is answered `409 PREFLIGHT_EXPIRED`, the CLI cannot fetch the result, and the run stays `unresolved`. Use the expected transaction id to learn on chain whether Selo was paid.
+  </Accordion>
+  <Accordion title="The state is local to one directory and one machine">
+    The refusal to pay again lives only in `.selo/runs/<release>.json` in the directory you ran from. Another directory, another machine, or a CI runner does not see it. In GitHub Actions the runner's workspace is not kept between runs, so a re-run of the job starts a new paid test; the action warns you not to re-run blindly. See [Gate deploys in GitHub Actions](/guides/github-actions).
+  </Accordion>
+  <Accordion title="Starting over after an unresolved run">
+    The CLI has no command to clear a run. While the file says `paying` or `unresolved`, it refuses every new paid run for that release id. Once you have checked on chain what happened to the expected transaction, you can test under a new `--release` id, or move the run state file aside yourself. Either way the next run is a new paid test.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Held payments and reconciliation" icon="scale-balanced" href="/concepts/reconciliation">
+    What Selo does on its side with a payment it could not confirm.
+  </Card>
+  <Card title="Output files" icon="file" href="/cli/files">
+    Every field of the run state, the summary and the attestation.
+  </Card>
+</CardGroup>

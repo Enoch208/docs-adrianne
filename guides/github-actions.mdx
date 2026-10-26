@@ -1,0 +1,379 @@
+---
+title: "Gate deploys in GitHub Actions"
+description: "Promote a commit to production only after Selo has paid the staged release and signed a PASS for that exact commit."
+icon: "github"
+sidebarTitle: "GitHub Actions"
+---
+
+The Selo release gate ships as a composite GitHub Action. It runs the same `selo` CLI as your terminal, in three modes: a free `preflight`, a paid `test`, and an offline `verify` of a signed verdict. A FAIL, an INCONCLUSIVE, an unconfirmed payment, an expired authorization or a missing report fails the job, and the promote job never runs.
+
+```text
+push to main ──► stage ─────────────► paid-gate ──────────────────► promote
+                 build, deploy        environment: selo-paid-release  runs only if the gate
+                 staging, free        (required reviewers) pays Selo  output is ALLOW, then
+                 preflight            once; exit 0 only on PASS;      verifies the signed
+                                      saves the signed attestation    attestation offline
+```
+
+## Reference the action
+
+The action lives in the Selo repository at `.github/actions/release-gate`:
+
+```yaml
+uses: Enoch208/selo/.github/actions/release-gate@main
+```
+
+<Warning>
+  Pin the action to a full commit SHA of the Selo repository that you have reviewed, instead of `@main`. The action installs the CLI from the same checkout, so the SHA pins the code that handles your wallet.
+</Warning>
+
+On every run the action sets up Node 24, installs the CLI from its own checkout with `npx --yes pnpm@10.33.0 install --frozen-lockfile --filter "@selo/cli..."`, and runs `packages/cli/bin/selo.js`. Relative paths such as `selo/contract.json` resolve from your workspace.
+
+## The three modes
+
+<Tabs>
+  <Tab title="preflight">
+    Free. Needs no wallet and spends nothing. It checks the authorization, your endpoint's 402, the network, the asset and the price.
+
+    ```yaml
+    - uses: Enoch208/selo/.github/actions/release-gate@main
+      with:
+        mode: preflight
+        authorization: ${{ vars.SELO_AUTHORIZATION_ID }}
+        url: https://staging.example.com/v1/orders
+        method: POST
+        body: selo/order.json
+    ```
+
+    | Output | Value |
+    | --- | --- |
+    | `gate` | `ELIGIBLE` on exit `0`, otherwise `BLOCK` |
+    | `verdict` | Always `none` |
+    | `exit-code` | `0` eligible, `3` ineligible or refused, `2` Selo unavailable |
+  </Tab>
+  <Tab title="test">
+    Pays Selo once and gates on the verdict. Needs `SELO_PAYER_MNEMONIC` in the step's environment. It deletes any old summary and attestation files first, so a stale file can never open the gate.
+
+    ```yaml
+    - id: selo
+      uses: Enoch208/selo/.github/actions/release-gate@main
+      env:
+        SELO_PAYER_MNEMONIC: ${{ secrets.SELO_PAYER_MNEMONIC }}
+      with:
+        mode: test
+        authorization: ${{ vars.SELO_AUTHORIZATION_ID }}
+        url: https://staging.example.com/v1/orders
+        method: POST
+        body: selo/order.json
+        contract: selo/contract.json
+        release: ${{ github.sha }}
+        network: mainnet
+        max-usdc: "1.00"
+        pay-to: ${{ vars.SELO_PAY_TO }}
+        approve-mainnet: "true"
+    ```
+
+    | Output | Value |
+    | --- | --- |
+    | `gate` | `ALLOW` only for a fully evidenced PASS, otherwise `BLOCK`. Read from the summary file |
+    | `verdict` | `PASS`, `FAIL`, `INCONCLUSIVE`, or `none` when no report came back |
+    | `exit-code` | `0` PASS, `1` FAIL, `2` INCONCLUSIVE or unconfirmed, `3` refused before paying |
+
+    If the CLI ever exits `0` without an `ALLOW` summary, the action reports an error and blocks with exit `2`. On exit `2` it also prints a warning not to re-run the job until you have checked the earlier payment.
+  </Tab>
+  <Tab title="verify">
+    Offline. Checks a signed attestation against keys you trust, and that it attests the release, URL and method you expect. Needs no wallet and no Selo API call when the keys are a committed file.
+
+    ```yaml
+    - uses: Enoch208/selo/.github/actions/release-gate@main
+      with:
+        mode: verify
+        attestation: selo-attestation.json
+        keys: selo/attestation-keys.json
+        release: ${{ github.sha }}
+        url: https://staging.example.com/v1/orders
+        method: POST
+    ```
+
+    | Output | Value |
+    | --- | --- |
+    | `gate` | `ALLOW` on exit `0`, otherwise `BLOCK` |
+    | `verdict` | `PASS` on exit `0`, `FAIL` on exit `1`, otherwise `none` |
+    | `exit-code` | The attested verdict (`0` PASS, `1` FAIL, `2` INCONCLUSIVE), `2` when the attestation cannot be verified, or `3` for invalid input such as a missing `keys` |
+
+    See [Verify a signed verdict](/guides/verify-attestation).
+  </Tab>
+</Tabs>
+
+## Inputs
+
+| Input | Modes | Default | Meaning |
+| --- | --- | --- | --- |
+| `mode` | all | required | `preflight`, `test` or `verify` |
+| `api` | preflight, test | `https://api.useselo.xyz` | Selo API base URL |
+| `authorization` | preflight, test | empty | Verified `auth_…` id covering the target route and method |
+| `url` | all | required | `https` URL of the paid x402 endpoint |
+| `method` | all | required | `GET` or `POST` |
+| `body` | preflight, test | empty | Path to a JSON request body file, `POST` only |
+| `contract` | test | empty | Path to the release contract JSON |
+| `release` | test, verify | `${{ github.sha }}` | Release id, recorded as asserted by the caller |
+| `network` | test | empty | `testnet` or `mainnet` |
+| `max-usdc` | test | empty | Most this run may pay Selo, in USDC |
+| `pay-to` | test | empty | Selo's expected `payTo` address; required on Mainnet |
+| `approve-mainnet` | test | `"false"` | Set to `"true"` to allow a Mainnet payment |
+| `summary` | test | `selo-gate.json` | Where to write the sanitized `selo.gate.v1` summary |
+| `attestation` | test, verify | `selo-attestation.json` | Where test mode saves the signed attestation, and where verify mode reads it |
+| `keys` | verify | empty | Trusted attestation keys: an `https` URL or a committed JSON file |
+
+Every input except `mode` maps to the CLI flag of the same name; `approve-mainnet: "true"` adds `--approve-mainnet`. See [GitHub Action reference](/cli/github-action) and [selo test](/cli/test).
+
+## Set up a gated release
+
+<Steps>
+  <Step title="Create a dedicated payer wallet">
+    An Algorand account opted in to USDC (ASA `31566704`), funded with only what a few release tests cost. A release test costs Selo's price, 1.00 USDC. Selo pays your endpoint's own price from its wallet.
+  </Step>
+  <Step title="Authorize the staging route">
+    Run `selo auth create` for the exact staging URL and method, serve the printed line at `https://<staging origin>/.well-known/selo-verification.txt`, then run `selo auth verify`. An authorization lasts 24 hours after verification, so authorize again before a release window. See [Authorize your endpoint](/guides/authorize-endpoint).
+  </Step>
+  <Step title="Add the configuration">
+    | Name | Kind | Where | Value |
+    | --- | --- | --- | --- |
+    | `SELO_PAYER_MNEMONIC` | Secret | The `selo-paid-release` **environment**, not the repository | The payer wallet's 25 words |
+    | `SELO_AUTHORIZATION_ID` | Variable | Repository | The `auth_…` id |
+    | `SELO_PAY_TO` | Variable | Repository | Selo's payee, the `payTo` in Selo's 402. On the public API: `N37HMJCB4BAITC2ZU7C4XW7PUMCO4T3TUASHQEL6A4EWMLOTTHOB7IOOKY` |
+
+    In **Settings → Environments**, create `selo-paid-release`, add required reviewers, limit it to the `main` branch, and add the secret there.
+  </Step>
+  <Step title="Commit the contract, the body and the keys">
+    | File | What |
+    | --- | --- |
+    | `selo/contract.json` | Your [release contract](/guides/release-contract) |
+    | `selo/order.json` | The request body, for a `POST` route |
+    | `selo/attestation-keys.json` | Selo's attestation keys, downloaded once from `https://api.useselo.xyz/.well-known/selo-attestation-keys.json` and reviewed |
+
+    The promote job verifies the signed attestation against the committed keys, so it promotes only a PASS that Selo signed for this commit, URL and method.
+  </Step>
+  <Step title="Add the workflow">
+    Copy the workflow below and replace the build and deploy scripts with your own.
+  </Step>
+</Steps>
+
+## A complete workflow
+
+This is `examples/github-actions/release-gate.yml` from the Selo repository. `./scripts/build-and-test.sh` and `./scripts/deploy.sh` stand for your own build and deploy steps.
+
+```yaml .github/workflows/release-gate.yml
+name: Release behind a Selo gate
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SELO_API: https://api.useselo.xyz
+  TARGET_URL: https://staging.example.com/v1/orders
+
+jobs:
+  stage:
+    name: Build and stage (no wallet, no spend)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build and test
+        run: ./scripts/build-and-test.sh
+      - name: Deploy this commit to staging
+        run: ./scripts/deploy.sh staging "$GITHUB_SHA"
+      - name: Free Selo preflight against staging
+        uses: Enoch208/selo/.github/actions/release-gate@main
+        with:
+          mode: preflight
+          api: ${{ env.SELO_API }}
+          authorization: ${{ vars.SELO_AUTHORIZATION_ID }}
+          url: ${{ env.TARGET_URL }}
+          method: POST
+          body: selo/order.json
+
+  paid-gate:
+    name: Paid Selo release test
+    needs: stage
+    runs-on: ubuntu-latest
+    environment: selo-paid-release
+    outputs:
+      gate: ${{ steps.selo.outputs.gate }}
+      verdict: ${{ steps.selo.outputs.verdict }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Pay Selo once and gate on the verdict
+        id: selo
+        uses: Enoch208/selo/.github/actions/release-gate@main
+        env:
+          SELO_PAYER_MNEMONIC: ${{ secrets.SELO_PAYER_MNEMONIC }}
+        with:
+          mode: test
+          api: ${{ env.SELO_API }}
+          authorization: ${{ vars.SELO_AUTHORIZATION_ID }}
+          url: ${{ env.TARGET_URL }}
+          method: POST
+          body: selo/order.json
+          contract: selo/contract.json
+          release: ${{ github.sha }}
+          network: mainnet
+          max-usdc: "1.00"
+          pay-to: ${{ vars.SELO_PAY_TO }}
+          approve-mainnet: "true"
+          summary: selo-gate.json
+      - name: Keep the sanitized summary and the signed attestation
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: selo-gate-${{ github.sha }}
+          path: |
+            selo-gate.json
+            selo-attestation.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  promote:
+    name: Promote to production
+    needs: paid-gate
+    if: needs.paid-gate.result == 'success' && needs.paid-gate.outputs.gate == 'ALLOW'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Fetch the signed attestation
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: selo-gate-${{ github.sha }}
+      - name: Verify Selo signed a PASS for this exact commit and target
+        uses: Enoch208/selo/.github/actions/release-gate@main
+        with:
+          mode: verify
+          attestation: selo-attestation.json
+          keys: selo/attestation-keys.json
+          release: ${{ github.sha }}
+          url: ${{ env.TARGET_URL }}
+          method: POST
+      - name: Promote the commit Selo passed
+        run: ./scripts/deploy.sh production "$GITHUB_SHA"
+```
+
+What each job does:
+
+| Job | Wallet | Spends | Fails when |
+| --- | --- | --- | --- |
+| `stage` | none | nothing | The build fails, or the preflight is ineligible (for example an expired authorization), so you find out before anyone pays |
+| `paid-gate` | environment secret | 1.00 USDC to Selo | The verdict is not a fully evidenced PASS |
+| `promote` | none | nothing | The gate output is not `ALLOW`, or the attestation does not verify for this commit, URL and method |
+
+The job summary of `paid-gate` shows the verdict, each check, the job id and both transaction ids, because the CLI appends a Markdown table to `GITHUB_STEP_SUMMARY`.
+
+## How the wallet stays safe
+
+<AccordionGroup>
+  <Accordion title="The paid job runs only after review">
+    `paid-gate` runs only on a push to `main` or a manual dispatch, inside the protected `selo-paid-release` environment, so it waits for a reviewer. The mnemonic is an environment secret, available only to jobs in that environment.
+  </Accordion>
+  <Accordion title="No pull_request_target">
+    Pull requests, including those from forks, never reach the paid job. Do not add `pull_request_target` to this workflow: it runs with access to your repository's secrets on behalf of pull request events, and the paid job must never run for code you have not reviewed.
+  </Accordion>
+  <Accordion title="Inputs reach the script through the environment">
+    The action never interpolates an input into its shell script. Every input is passed as an environment variable (`SELO_MODE`, `SELO_URL`, `SELO_RELEASE` and so on), and the script reads those variables, so a value that contains shell syntax is treated as data, not as code.
+  </Accordion>
+  <Accordion title="Spending is capped and checked before signing">
+    `max-usdc` caps what one run may pay Selo. The CLI refuses a 402 on another network, a different payee, or a Mainnet payment without `approve-mainnet`, all before signing. Selo, in turn, spends at most 0.50 USDC on your endpoint per job.
+  </Accordion>
+  <Accordion title="A paid run is never cancelled or repeated on its own">
+    `cancel-in-progress: false` keeps a newer push from cancelling a paid run in flight. The CLI never retries a payment. If the outcome is unconfirmed it exits `2` with a warning. **Do not re-run the job blindly**: the run state lives in the runner's workspace, which a re-run does not keep, so a re-run starts a new paid test. Check the payer account for the expected transaction id printed in the log first. See [Recover an interrupted run](/guides/resume).
+  </Accordion>
+  <Accordion title="Nothing secret is published">
+    Logs, the job summary and the uploaded `selo-gate.json` and `selo-attestation.json` contain no mnemonic, no signed payment and no private report token. Do not upload the `.selo/` directory: it holds the private report link.
+  </Accordion>
+</AccordionGroup>
+
+## Proof: a blocked and a promoted release
+
+The Selo repository runs the `Release gate demo` workflow (`.github/workflows/release-gate-demo.yml`). You choose a release of the demo merchant, `broken-v1` or `fixed-v2`, and it verifies the signed Mainnet attestation of that release against the pinned key before a promote job may run. Its two jobs:
+
+```yaml .github/workflows/release-gate-demo.yml
+jobs:
+  gate:
+    name: Verify Selo's signed Mainnet verdict
+    runs-on: ubuntu-latest
+    outputs:
+      gate: ${{ steps.selo.outputs.gate }}
+      verdict: ${{ steps.selo.outputs.verdict }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Verify the attestation for this release against Selo's pinned key
+        id: selo
+        uses: ./.github/actions/release-gate
+        with:
+          mode: verify
+          attestation: docs/evidence/g5-release-gate-${{ inputs.release }}-attestation.json
+          keys: docs/evidence/selo-attestation-keys.json
+          release: ${{ inputs.release }}
+          url: https://demo.useselo.xyz/v1/orders
+          method: POST
+
+  promote:
+    name: Promote to production
+    needs: gate
+    if: needs.gate.result == 'success' && needs.gate.outputs.gate == 'ALLOW'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record the promotion of the release Selo passed
+        env:
+          RELEASE: ${{ inputs.release }}
+          VERDICT: ${{ needs.gate.outputs.verdict }}
+        run: |
+          echo "Selo verdict ${VERDICT} verified for ${RELEASE}; promoting." >> "$GITHUB_STEP_SUMMARY"
+          echo "Promoting ${RELEASE}"
+```
+
+On 26 October 2026 it ran once for each release:
+
+| Release | Attested verdict | Gate | Promote | Run |
+| --- | --- | --- | --- | --- |
+| `broken-v1` | FAIL | failed (exit `1`) | skipped | [Run 40308497965](https://github.com/Enoch208/selo/actions/runs/40308497965) |
+| `fixed-v2` | PASS | passed (exit `0`) | ran | [Run 40308508699](https://github.com/Enoch208/selo/actions/runs/40308508699) |
+
+The attestations it verified come from the paid Mainnet runs described in [Proof on Algorand Mainnet](/resources/mainnet-proof).
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| `stage` fails with exit `3` and `AUTHORIZATION_EXPIRED` | The authorization is older than 24 hours | [Re-authorize](/guides/authorize-endpoint#re-authorize) and update `SELO_AUTHORIZATION_ID` |
+| `paid-gate` fails with exit `3` and `SELO_PAYER_MNEMONIC is not set` | The secret is missing from the `selo-paid-release` environment, or the step does not pass it in `env` | Add it as an environment secret and pass it in the step's `env` |
+| `paid-gate` fails with exit `3` and `refusing: the 402 names payTo …` | `SELO_PAY_TO` does not match Selo's 402 | Confirm Selo's payee and update the variable |
+| `paid-gate` fails with exit `3` and `Selo did not accept the payment` | The payer lacks USDC or is not opted in | Fund the payer wallet |
+| `paid-gate` fails with exit `2` and a warning not to re-run | The payment outcome is unconfirmed | Check the expected transaction id in the log on an explorer before anything else |
+| `paid-gate` fails with exit `1` | A release check proved a FAIL | Read the failed check in the job summary, fix the release, push again |
+| `promote` is skipped | The gate output was not `ALLOW` | This is the gate working. Read the `paid-gate` summary |
+| `promote` fails in verify mode with `not verified: it attests release …` | The attestation is for another commit | Promote only the commit that was tested |
+| `mode must be preflight, test or verify` | A typo in `mode` | Fix the input |
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Verify a signed verdict" icon="certificate" href="/guides/verify-attestation">
+    What verify mode checks, and how to check it yourself.
+  </Card>
+  <Card title="GitHub Action reference" icon="book" href="/cli/github-action">
+    Every input and output in one place.
+  </Card>
+</CardGroup>

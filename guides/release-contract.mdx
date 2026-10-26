@@ -1,0 +1,206 @@
+---
+title: "Write a release contract"
+description: "Declare the status, content type and JSON Schema a paid response must satisfy, so Selo fails a release that breaks them."
+icon: "file-contract"
+---
+
+A release contract states what a paying client depends on: the status code, the content type and the shape of the body. Selo checks the paid response against it in the `response_contract` check. A mismatch is a proven FAIL, and a FAIL blocks the release.
+
+## The format
+
+A contract is a JSON object with three optional fields and nothing else:
+
+```json contract.json
+{
+  "status": 200,
+  "contentType": "application/json",
+  "jsonSchema": {
+    "type": "object",
+    "required": ["id"],
+    "properties": { "id": { "type": "string" } }
+  }
+}
+```
+
+<ParamField body="status" type="integer" default="200">
+  The expected HTTP status of the paid response, from 100 to 599.
+</ParamField>
+<ParamField body="contentType" type="string">
+  The expected media type, written as `type/subtype`, at most 200 characters. It is compared case-insensitively with the media type of the response's `Content-Type`, ignoring parameters, so `application/json; charset=utf-8` matches `application/json`. Omit it to skip the check.
+</ParamField>
+<ParamField body="jsonSchema" type="object">
+  A JSON Schema the parsed response body must satisfy, at most 16 KiB once serialized. Omit it to skip body validation.
+</ParamField>
+
+Any other top-level key is rejected. An empty contract `{}` checks only that the status is `200`.
+
+The file has the shape of the `expected` field of `POST /v1/release-test`. `selo test --contract contract.json` sends it as `expected`, and a raw API client sends the same object. See [Pay with any x402 client](/guides/any-x402-client).
+
+## How a contract is compiled
+
+The schema is compiled with Ajv 8 in strict mode, using Ajv's default JSON Schema dialect, draft-07. A contract is compiled twice before anyone pays:
+
+- by the CLI, which exits `3` before sending any request;
+- by Selo's API, which answers `400 VALIDATION_FAILED` with the message `expected: <issue>` before asking for payment.
+
+These are the errors you are most likely to meet. The CLI prints each message after `the contract file <path> is not usable:`, and the API after `expected:`. Schema errors start with `jsonSchema failed to compile:`, followed by Ajv's own message.
+
+| You wrote | Message |
+| --- | --- |
+| A status outside 100 to 599 | `status must be an integer between 100 and 599, received 99` |
+| A content type that is not a media type | `contentType must be a "type/subtype" media type, received "json"` |
+| A schema over 16 KiB | `jsonSchema must serialize to at most 16384 bytes, received …` |
+| `"$schema": "https://json-schema.org/draft/2020-12/schema"` | `no schema with key or ref "https://json-schema.org/draft/2020-12/schema"` |
+| A `format` keyword | `unknown format "date-time" ignored in schema at path "#/properties/at"` |
+| A name in `required` that is not under `properties` | `strict mode: required property "a" is not defined at "#" (strictRequired)` |
+| `required` or `properties` without `"type": "object"` | `strict mode: missing type "object" for keyword "required" at "#" (strictTypes)` |
+| `pattern` without `"type": "string"`, `minimum` without a numeric type | `strict mode: missing type "string" for keyword "pattern" at "#" (strictTypes)` |
+| An unknown keyword | `strict mode: unknown keyword: "foo"` |
+| A union such as `"type": ["string", "number"]` | `strict mode: use allowUnionTypes to allow union type keyword at "#" (strictTypes)` |
+| A tuple `items` array without `minItems` or `additionalItems` | `strict mode: "items" is 1-tuple, but minItems or maxItems/additionalItems are not specified or different at path "#"` |
+
+A top-level key other than `status`, `contentType` and `jsonSchema` is rejected before compiling. The CLI prints `the contract file contract.json must be { status?, contentType?, jsonSchema? }: Unrecognized key: "expected"`, and the API answers `400 VALIDATION_FAILED`.
+
+These compile without trouble: `title`, `description` and `examples`; `const` and `enum`; `pattern` on a `string`; nested objects and arrays; `$ref` into `definitions` or `$defs`; a nullable type written as `["string", "null"]`; and `"$schema": "http://json-schema.org/draft-07/schema#"`.
+
+## How a paid response is evaluated
+
+Selo reads the paid response body, up to 256 KiB, then checks in this order and reports the first mismatch:
+
+<Steps>
+  <Step title="Status">
+    The response status must equal `status`.
+  </Step>
+  <Step title="Content type">
+    If `contentType` is set, the response's media type must match it.
+  </Step>
+  <Step title="Body">
+    If `jsonSchema` is set, the body must be non-empty, valid JSON, and satisfy the schema. Only the first schema error is reported.
+  </Step>
+</Steps>
+
+| Status | Code | When | Example summary |
+| --- | --- | --- | --- |
+| PASS | `CONTRACT_MATCHED` | Everything matched | `Observed response matched the expected status 200 and content type application/json.` |
+| FAIL | `STATUS_MISMATCH` | The status differs | `Expected status 200 but observed 500.` |
+| FAIL | `CONTENT_TYPE_MISMATCH` | The media type differs, or there is no `Content-Type` | `Expected content type application/json but observed text/html.` |
+| FAIL | `BODY_NOT_JSON` | A schema is set and the body is empty or not valid JSON | `A JSON schema was expected but the response body was not valid JSON.` |
+| FAIL | `SCHEMA_MISMATCH` | The body breaks the schema | `Response body did not match the expected schema: must have required property 'receiptId'` |
+| INCONCLUSIVE | `BODY_TOO_LARGE` | The paid body is over 256 KiB | The contract was not evaluated |
+| INCONCLUSIVE | `BODY_READ_TIMEOUT` | The body did not arrive in time | The contract was not evaluated |
+| INCONCLUSIVE | `BODY_READ_FAILED` | The connection failed while reading the body | The contract was not evaluated |
+| INCONCLUSIVE | `NOT_RUN` | There was no paid response to evaluate | The check did not run |
+
+A `SCHEMA_MISMATCH` summary is the error's location and message, cut at 200 characters. `response_contract` is a blocking check, so a FAIL with evidence makes the verdict FAIL. See [The five release checks](/concepts/checks) and [Verdicts and the gate](/concepts/verdicts).
+
+## Worked example: the demo merchant
+
+The [demo merchant](/guides/demo-merchant) sells one order and returns a receipt. Its contract is in the Selo repository at `examples/merchant/contract.json`:
+
+```json contract.json
+{
+  "status": 200,
+  "contentType": "application/json",
+  "jsonSchema": {
+    "type": "object",
+    "required": ["orderId", "receiptId", "fulfilled"],
+    "properties": {
+      "orderId": { "type": "string", "pattern": "^ord_[0-9a-f]{24}$" },
+      "receiptId": { "type": "string", "pattern": "^rcpt_[0-9a-f]{24}$" },
+      "fulfilled": { "const": true }
+    }
+  }
+}
+```
+
+It ships two releases at the same URL. Both answer `200` with `application/json` after the payment settles. The difference is one field name:
+
+<CodeGroup>
+```json broken-v1
+{
+  "orderId": "ord_<24 hex characters>",
+  "receipt_id": "rcpt_<24 hex characters>",
+  "sku": "demo-widget",
+  "quantity": 1,
+  "fulfilled": true,
+  "release": "broken-v1"
+}
+```
+
+```json fixed-v2
+{
+  "orderId": "ord_<24 hex characters>",
+  "receiptId": "rcpt_<24 hex characters>",
+  "sku": "demo-widget",
+  "quantity": 1,
+  "fulfilled": true,
+  "release": "fixed-v2"
+}
+```
+</CodeGroup>
+
+On Algorand Mainnet on 26 October 2026, Selo tested both. These are the recorded `response_contract` results:
+
+| Release | Status | Code | Summary |
+| --- | --- | --- | --- |
+| `broken-v1` | FAIL | `SCHEMA_MISMATCH` | `Response body did not match the expected schema: must have required property 'receiptId'` |
+| `fixed-v2` | PASS | `CONTRACT_MATCHED` | `Observed response matched the expected status 200 and content type application/json.` |
+
+A health check, a status check and a content-type check all pass on `broken-v1`. Only the schema catches the renamed field. The extra fields `sku`, `quantity` and `release` do not matter, because the schema does not close the object.
+
+### Which contract did a verdict use?
+
+Every signed attestation records `expectedContractSha256`: the SHA-256 of the contract as canonical JSON, with keys sorted at every level and no whitespace. You can recompute it from your file:
+
+```bash Terminal
+node -e '
+const sort = (v) => Array.isArray(v) ? v.map(sort)
+  : v !== null && typeof v === "object"
+    ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort(v[k])])) : v;
+const contract = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+console.log(require("crypto").createHash("sha256").update(JSON.stringify(sort(contract))).digest("hex"));
+' examples/merchant/contract.json
+```
+
+```text Output
+6e5b149b1088d214be6a1c097e2e06bf1127fe529c544731023abea7b03e7170
+```
+
+That is the `expectedContractSha256` in both of the demo merchant's Mainnet attestations. See [Verify a signed verdict](/guides/verify-attestation).
+
+## Tips for a good contract
+
+<AccordionGroup>
+  <Accordion title="Require what your clients read">
+    List in `required` every field a buyer's integration depends on, and nothing it does not. A field you plan to remove should not be required.
+  </Accordion>
+  <Accordion title="Leave the object open unless the shape is closed">
+    `additionalProperties: false` turns every new field into a FAIL. Use it only if adding a field really breaks your clients.
+  </Accordion>
+  <Accordion title="Use pattern and const instead of format">
+    No `format` is available, so `date-time`, `email` or `uuid` fail to compile. Use `pattern` on a `string` for id and date shapes, and `const` for values that must never change, such as `"fulfilled": { "const": true }`.
+  </Accordion>
+  <Accordion title="Declare the type next to every type-specific keyword">
+    Strict mode wants `"type": "object"` next to `required` and `properties`, `"type": "string"` next to `pattern`, and a numeric type next to `minimum` or `maximum`.
+  </Accordion>
+  <Accordion title="Set the status and content type explicitly">
+    `status` defaults to `200`, and the content type is not checked unless you set it. A route that starts answering `201` or `text/plain` is caught only if you say what you expect.
+  </Accordion>
+  <Accordion title="Keep it in the repository, next to the code">
+    Commit the contract, for example as `selo/contract.json`, so it changes in the same pull request as the response. The demo merchant has a test that keeps `contract.json` equal to the receipt schema it advertises in its Bazaar listing.
+  </Accordion>
+  <Accordion title="Fix one error at a time">
+    Only the first schema error is reported. After you fix it, another mismatch may surface on the next run.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Run a release test" icon="flask" href="/guides/run-release-test">
+    Pass the contract with `--contract` and gate on the verdict.
+  </Card>
+  <Card title="Try it with the demo merchant" icon="store" href="/guides/demo-merchant">
+    Reproduce the FAIL and the PASS yourself.
+  </Card>
+</CardGroup>

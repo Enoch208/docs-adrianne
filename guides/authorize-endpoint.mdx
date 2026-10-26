@@ -1,0 +1,265 @@
+---
+title: "Authorize your endpoint"
+description: "Prove you control a paid route by serving a one-line token from its origin, so Selo is allowed to test it."
+icon: "key"
+---
+
+Selo only calls a route its owner has authorized. You prove control of one origin, route and method by serving a token that Selo gives you at a well-known path on your own domain. Authorization is free and needs no wallet.
+
+## What an authorization covers
+
+An authorization covers exactly one target. Selo never infers consent from a neighbouring route or method.
+
+| Part | Rule | Example |
+| --- | --- | --- |
+| Origin | `https://` scheme, public hostname, default port 443 | `https://api.example.com` |
+| Route | The exact URL path. The query string is not part of it, and a trailing slash makes a different path | `/v1/orders` |
+| Method | `GET` or `POST` | `POST` |
+
+An authorization for `POST https://api.example.com/v1/orders` does not cover `GET /v1/orders`, `POST /v1/orders/` or `POST /v1/orders/123`. Authorize each route and method you want to test.
+
+| Stage | Lifetime |
+| --- | --- |
+| Challenge (`PENDING`) | 1 hour to serve the token and verify |
+| Authorization (`VERIFIED`) | 24 hours from the moment it was verified |
+
+Selo checks the authorization again when you preflight, when you pay for a release test, when the test starts, and before it replays the payment. See [Authorization](/concepts/authorization) for the model behind it.
+
+## Prerequisites
+
+- The HTTPS URL of your paid route on a public hostname. IP addresses, `localhost`, single-label hosts, the suffixes `.local`, `.localhost`, `.internal`, `.lan` and `.home.arpa`, and non-default ports are refused.
+- A way to serve a static text file at `https://<your origin>/.well-known/selo-verification.txt`.
+- A checkout of the Selo repository with `pnpm install --frozen-lockfile` (Node 24, pnpm 10) to use the CLI, or `curl` to call the API directly. See [CLI overview](/cli/overview).
+
+## Authorize with the CLI
+
+<Steps>
+  <Step title="Request a challenge">
+    ```bash Terminal
+    API=https://api.useselo.xyz
+    URL=https://api.example.com/v1/orders
+
+    pnpm selo auth create --api $API --url $URL --method POST \
+      --project shop --contact you@example.com
+    ```
+
+    | Flag | Required | Meaning |
+    | --- | --- | --- |
+    | `--api` | yes | Selo's API base URL. Must be `https`; `http` is accepted only for `localhost` |
+    | `--url` | yes | The `https` URL of your paid route |
+    | `--method` | yes | `GET` or `POST` |
+    | `--project` | yes | A name for your project, 1 to 80 characters |
+    | `--contact` | yes | How to reach the route's owner, 3 to 200 characters |
+
+    Selo answers with a pending authorization and the exact line to serve:
+
+    ```text Output
+    authorization auth_…: PENDING
+    serve this line at https://api.example.com/.well-known/selo-verification.txt:
+    selo-verification=<token>
+    then run: selo auth verify --api https://api.useselo.xyz --authorization auth_…
+    ```
+
+    The token is a random 43-character value. Selo stores only its SHA-256 hash and never returns it again, so copy the line now.
+  </Step>
+  <Step title="Serve the verification line">
+    Publish the line, exactly as printed, at `/.well-known/selo-verification.txt` on the same origin as your route.
+
+    ```text selo-verification.txt
+    selo-verification=<token for POST /v1/orders>
+    ```
+
+    The file may hold several lines, so one file can authorize several routes or keep an older authorization's line next to a new one:
+
+    ```text selo-verification.txt
+    selo-verification=<token for POST /v1/orders>
+    selo-verification=<token for GET /v1/quote>
+    ```
+
+    Check that it is reachable before you verify:
+
+    ```bash Terminal
+    curl -s https://api.example.com/.well-known/selo-verification.txt
+    ```
+  </Step>
+  <Step title="Verify">
+    ```bash Terminal
+    pnpm selo auth verify --api $API --authorization auth_…
+    ```
+
+    ```text Output
+    authorization auth_…: VERIFIED
+    covers        POST https://api.example.com/v1/orders (well_known_file)
+    expires       <24 hours after verification, ISO 8601>
+    ```
+
+    The command exits `0` when the authorization is `VERIFIED`. Keep the `auth_…` id: [`selo preflight`](/guides/preflight) and [`selo test`](/guides/run-release-test) need it, and in CI it becomes the `SELO_AUTHORIZATION_ID` variable.
+  </Step>
+  <Step title="Check the status at any time">
+    ```bash Terminal
+    pnpm selo auth status --api $API --authorization auth_…
+    ```
+
+    It prints the same three lines. It exits `0` only while the authorization is `VERIFIED`, and `3` when it is `PENDING`, `EXPIRED` or `REVOKED`.
+  </Step>
+</Steps>
+
+## How Selo fetches the file
+
+When you run `verify`, Selo makes one `GET` request to `https://<your origin>/.well-known/selo-verification.txt` with `Accept: text/plain`, through the same network guard it uses for every target.
+
+| Rule | Detail |
+| --- | --- |
+| HTTPS only | The origin must be `https` on port 443 |
+| Public addresses only | Every DNS answer for the hostname must be a public address. The connection is pinned to the vetted address |
+| Redirects | At most 3, and every hop must stay on the same origin. Each hop is validated again. A redirect to another host, such as `www.`, is refused |
+| Status | The final answer must be a `2xx` |
+| Time | 10 seconds |
+| Size | At most 4096 bytes |
+| Matching | The file is split into lines (LF or CRLF) and each line is trimmed. A line matches when it starts with `selo-verification=` and the rest equals the token exactly. Other lines are ignored |
+| Content type | Not checked |
+
+The comparison is made on SHA-256 hashes in constant time, so the token you serve is compared with the hash Selo stored when it created the challenge.
+
+## Re-authorize
+
+An authorization does not renew itself. Running `verify` again on a verified authorization returns it unchanged and does not extend its expiry.
+
+1. When `selo auth status` reports `EXPIRED`, run `selo auth create` again. You get a new `auth_…` id and a new line.
+2. Add the new line to `selo-verification.txt`. You can leave older lines in place.
+3. Run `selo auth verify` with the new id, and update anything that stores the old id, such as the `SELO_AUTHORIZATION_ID` variable in CI.
+
+<Warning>
+  Authorize shortly before a release window. A preflight or a paid request with an expired authorization is refused before anything is charged. If the authorization lapses after Selo has accepted your payment but before the test starts, or before the replay, the test stops and the verdict is INCONCLUSIVE with `AUTHORIZATION_LAPSED`.
+</Warning>
+
+## The same flow with the API
+
+Every step is a plain HTTP call. None of them is paid.
+
+<Steps>
+  <Step title="Create the challenge">
+    ```bash Terminal
+    curl -s -X POST https://api.useselo.xyz/v1/authorizations \
+      -H 'content-type: application/json' \
+      -d '{"targetUrl":"https://api.example.com/v1/orders","method":"POST","project":"shop","contact":"you@example.com"}'
+    ```
+
+    <ParamField body="targetUrl" type="string" required>
+      The `https` URL of your paid route, at most 2048 characters.
+    </ParamField>
+    <ParamField body="method" type="string" required>
+      `GET` or `POST`.
+    </ParamField>
+    <ParamField body="project" type="string" required>
+      1 to 80 characters after trimming.
+    </ParamField>
+    <ParamField body="contact" type="string" required>
+      3 to 200 characters after trimming.
+    </ParamField>
+
+    Unknown fields are rejected. Selo answers `201`:
+
+    ```json 201 Created
+    {
+      "authorizationId": "auth_…",
+      "status": "PENDING",
+      "origin": "https://api.example.com",
+      "routePath": "/v1/orders",
+      "method": "POST",
+      "verificationUrl": "https://api.example.com/.well-known/selo-verification.txt",
+      "expectedContent": "selo-verification=<token>"
+    }
+    ```
+
+    <ResponseField name="authorizationId" type="string">The id to verify and to pass to preflight.</ResponseField>
+    <ResponseField name="status" type="string">`PENDING` until verified.</ResponseField>
+    <ResponseField name="origin" type="string">The origin the authorization covers.</ResponseField>
+    <ResponseField name="routePath" type="string">The exact path the authorization covers.</ResponseField>
+    <ResponseField name="method" type="string">The method the authorization covers.</ResponseField>
+    <ResponseField name="verificationUrl" type="string">Where Selo will look for the line.</ResponseField>
+    <ResponseField name="expectedContent" type="string">The line to serve. It is returned only here.</ResponseField>
+  </Step>
+  <Step title="Verify">
+    ```bash Terminal
+    curl -s -X POST https://api.useselo.xyz/v1/authorizations/auth_…/verify
+    ```
+
+    The request needs no body. Selo fetches your file and answers `200` with the authorization:
+
+    ```json 200 OK
+    {
+      "authorizationId": "auth_…",
+      "status": "VERIFIED",
+      "origin": "https://api.example.com",
+      "routePath": "/v1/orders",
+      "method": "POST",
+      "type": "well_known_file",
+      "verifiedAt": "<ISO 8601>",
+      "expiresAt": "<verifiedAt + 24 hours>"
+    }
+    ```
+  </Step>
+  <Step title="Read the status">
+    ```bash Terminal
+    curl -s https://api.useselo.xyz/v1/authorizations/auth_…
+    ```
+
+    The answer has the same shape. A verified authorization past its expiry is reported, and stored, as `EXPIRED`.
+
+    <ResponseField name="status" type="string">
+      `PENDING`, `VERIFIED`, `EXPIRED` or `REVOKED`.
+    </ResponseField>
+    <ResponseField name="type" type="string">
+      `well_known_file` for the flow on this page. `manual_owner_consent` marks an authorization an operator of a Selo deployment recorded by hand, with a note, after the route's owner consented explicitly.
+    </ResponseField>
+    <ResponseField name="verifiedAt" type="string | null">
+      When the authorization was verified, or `null` while pending.
+    </ResponseField>
+    <ResponseField name="expiresAt" type="string">
+      For a pending authorization, when the challenge expires (1 hour after creation). For a verified one, 24 hours after `verifiedAt`.
+    </ResponseField>
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+Errors come back as JSON with an `error` code and a `message`. The CLI prints them as `HTTP <status> <CODE>: <message>` and exits `3` for a `4xx` and `2` for a `5xx` or when Selo cannot be reached.
+
+| Code | HTTP | When | What to do |
+| --- | --- | --- | --- |
+| `VALIDATION_FAILED` | 400 | The create body is invalid: a method other than `GET` or `POST`, an empty project, a contact shorter than 3 characters, or an unknown field | Fix the request body |
+| `TARGET_URL_INVALID` | 400 | The URL is not absolute, or it carries a username or password | Pass a full `https://host/path` URL |
+| `TARGET_NOT_HTTPS` | 400 | The URL is not `https` | Serve the route over HTTPS |
+| `TARGET_ADDRESS_BLOCKED` | 400 on create, 422 on verify | On create: an IP literal, a blocked hostname or a non-default port. On verify: the hostname resolved to a private, loopback, link-local or otherwise non-public address | Use a public hostname on port 443 that resolves only to public addresses |
+| `NOT_FOUND` | 404 | The `auth_…` id does not exist or is malformed | Check the id you copied |
+| `VERIFICATION_FAILED` | 409 | The file answered with a non-`2xx` status, has no matching line, or is larger than 4 KiB | Serve the exact line at the exact path; check it with `curl` |
+| `VERIFICATION_UNREACHABLE` | 502 | The file did not answer within 10 seconds, or the connection failed | Check DNS, TLS and firewall rules, then verify again |
+| `ORIGIN_NOT_ALLOWED` | 422 | A redirect left your origin | Serve the file directly on the route's origin |
+| `TOO_MANY_REDIRECTS` | 422 | More than 3 redirects | Serve the file without redirects |
+| `CHALLENGE_EXPIRED` | 409 | More than an hour passed since `auth create` | Run `selo auth create` again |
+| `AUTHORIZATION_EXPIRED` | 409 | The authorization was verified once and has expired | [Re-authorize](#re-authorize) |
+| `AUTHORIZATION_REVOKED` | 409 | The authorization was revoked | Create a new authorization |
+
+<AccordionGroup>
+  <Accordion title="My CDN redirects the file to www or to another domain">
+    Selo follows a redirect only while it stays on the origin it is verifying. Serve `/.well-known/selo-verification.txt` directly on the exact origin of your paid route, for example with a static rule at the edge.
+  </Accordion>
+  <Accordion title="Verification works, but preflight says AUTHORIZATION_MISSING">
+    The preflight URL or method does not match the authorization exactly. Compare the `covers` line from `selo auth status` with the URL and method you pass to `selo preflight`, including any trailing slash. See [Run a preflight](/guides/preflight).
+  </Accordion>
+  <Accordion title="I need to test the same route with GET and POST">
+    Create two authorizations, one per method, and serve both lines in the same file.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Run a preflight" icon="clipboard-check" href="/guides/preflight">
+    Check eligibility and every price for free.
+  </Card>
+  <Card title="selo auth reference" icon="terminal" href="/cli/auth">
+    Every flag and exit code of the auth commands.
+  </Card>
+</CardGroup>

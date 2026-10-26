@@ -1,0 +1,228 @@
+---
+title: "Run a preflight"
+description: "Check for free that Selo can test your endpoint, and see every price, before anyone pays."
+icon: "clipboard-check"
+---
+
+A preflight is free. Selo sends one unpaid request to your endpoint, reads its 402 and decides whether a paid release test can run within budget. An eligible preflight returns a `pfl_…` id that stays valid for 15 minutes; the paid release test must name it.
+
+## What preflight checks
+
+Selo runs these checks in order and stops at the first one that fails.
+
+<Steps>
+  <Step title="The target URL">
+    An absolute `https` URL on a public hostname, on the default port, with no username or password.
+  </Step>
+  <Step title="The authorization">
+    The authorization exists, is `VERIFIED`, has not expired, and covers the exact origin, path and method. Nothing is sent to your endpoint if this fails. See [Authorize your endpoint](/guides/authorize-endpoint).
+  </Step>
+  <Step title="One unpaid request">
+    Selo sends your method and, for `POST`, your JSON body with `content-type: application/json` and an `Idempotency-Key: preflight-<preflight id>` header. It resolves DNS, refuses the request if any answer is not a public address, pins the connection to the vetted address, waits at most 10 seconds and does not follow redirects.
+  </Step>
+  <Step title="The 402 challenge">
+    The answer must be a `402` whose `PAYMENT-REQUIRED` header decodes to an x402 version 2 challenge. It must offer an `exact` requirement on Algorand Mainnet in USDC (ASA `31566704`) with a positive integer amount and a valid Algorand `payTo` address.
+  </Step>
+  <Step title="The price">
+    The price of that requirement must be at most 0.50 USDC, the most Selo spends on a target in one job. Exactly 0.50 is accepted.
+  </Step>
+  <Step title="A Bazaar snapshot">
+    Selo looks your route up in the Bazaar catalog among the listings of the `payTo` in your 402 and stores what it finds, for the discovery check later. A missing listing or an unreachable catalog never makes a preflight ineligible.
+  </Step>
+</Steps>
+
+<Info>
+  Your endpoint receives exactly one unpaid request per preflight. Nothing is signed and nothing is paid.
+</Info>
+
+## Prerequisites
+
+- A verified authorization for the exact URL and method. See [Authorize your endpoint](/guides/authorize-endpoint).
+- For `POST`, the JSON body Selo should send. The same body is used for the paid request and for the replay in the release test.
+
+## Run a preflight with the CLI
+
+<Steps>
+  <Step title="Write the request body (POST only)">
+    ```json body.json
+    { "sku": "demo-widget", "quantity": 1 }
+    ```
+
+    The body is any JSON value except a top-level `null`, at most 16 KiB once serialized. A `GET` takes no body.
+  </Step>
+  <Step title="Run it">
+    ```bash Terminal
+    API=https://api.useselo.xyz
+    URL=https://api.example.com/v1/orders
+
+    pnpm selo preflight --api $API --authorization auth_… --url $URL --method POST --body body.json
+    ```
+
+    | Flag | Required | Meaning |
+    | --- | --- | --- |
+    | `--api` | yes | Selo's API base URL (`https`; `http` only for `localhost`) |
+    | `--authorization` | yes | The verified `auth_…` id |
+    | `--url` | yes | The `https` URL of your paid route |
+    | `--method` | yes | `GET` or `POST` |
+    | `--body` | no | Path to a JSON file with the request body, `POST` only. The file may be at most 64 KiB, and the API accepts at most 16 KiB |
+  </Step>
+  <Step title="Read the terms">
+    ```text Output
+    preflight  pfl_…: eligible until <ISO 8601 time>
+    target     POST https://api.example.com/v1/orders
+    target fee 0.01 USDC, paid by Selo
+    Selo cap   0.01 USDC at most spent on the target
+    you pay    1.00 USDC to Selo for the release test
+    ```
+
+    | Line | Meaning |
+    | --- | --- |
+    | `preflight` | The id and when it expires, 15 minutes after the preflight |
+    | `target` | The method and URL Selo will pay |
+    | `target fee` | Your endpoint's price, read from its 402. Selo pays it from its own wallet |
+    | `Selo cap` | The most Selo will spend on your endpoint in this job |
+    | `you pay` | Selo's price for the release test |
+
+    The command exits `0` when the target is eligible.
+  </Step>
+</Steps>
+
+<Tip>
+  `selo test` runs its own fresh preflight on every run, so you never pass a `pfl_…` id to it. Use `selo preflight` to check eligibility and terms without a wallet, for example in a free CI stage. See [Gate deploys in GitHub Actions](/guides/github-actions).
+</Tip>
+
+## The API call
+
+```bash Terminal
+curl -s -X POST https://api.useselo.xyz/v1/preflight \
+  -H 'content-type: application/json' \
+  -d '{"authorizationId":"auth_…","targetUrl":"https://api.example.com/v1/orders","method":"POST","requestBody":{"sku":"demo-widget","quantity":1}}'
+```
+
+<ParamField body="authorizationId" type="string" required>
+  The verified `auth_…` id, at most 64 characters.
+</ParamField>
+<ParamField body="targetUrl" type="string" required>
+  The `https` URL of your paid route, at most 2048 characters.
+</ParamField>
+<ParamField body="method" type="string" required>
+  `GET` or `POST`.
+</ParamField>
+<ParamField body="requestBody" type="any JSON value">
+  `POST` only. Any JSON value except a top-level `null`, at most 16 KiB once serialized. Omit it to send no body.
+</ParamField>
+
+Unknown fields are rejected with `400 VALIDATION_FAILED`, and the whole request may be at most 64 KiB.
+
+### Eligible
+
+An eligible preflight answers `201 Created`:
+
+```json 201 Created
+{
+  "eligible": true,
+  "preflightId": "pfl_…",
+  "target": {
+    "url": "https://api.example.com/v1/orders",
+    "method": "POST",
+    "priceUsdc": "0.01"
+  },
+  "estimatedMaxSpendUsdc": "0.01",
+  "seloPriceUsdc": "1.00",
+  "expiresAt": "<ISO 8601, 15 minutes after the preflight>"
+}
+```
+
+<ResponseField name="eligible" type="boolean">`true`.</ResponseField>
+<ResponseField name="preflightId" type="string">The id the paid release test must name.</ResponseField>
+<ResponseField name="target" type="object">
+  <Expandable title="properties">
+    <ResponseField name="url" type="string">The normalized target URL.</ResponseField>
+    <ResponseField name="method" type="string">`GET` or `POST`.</ResponseField>
+    <ResponseField name="priceUsdc" type="string">Your endpoint's price as a decimal USDC string.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="estimatedMaxSpendUsdc" type="string">The most Selo will spend on your endpoint in this job. A `quick` test pays once; the replay re-sends the same signed payment.</ResponseField>
+<ResponseField name="seloPriceUsdc" type="string">What the release test costs you.</ResponseField>
+<ResponseField name="expiresAt" type="string">When the preflight stops being payable.</ResponseField>
+
+### Ineligible
+
+An ineligible preflight answers with the HTTP status of its reason and this body:
+
+```json 422 Unprocessable Entity
+{
+  "eligible": false,
+  "preflightId": "pfl_…",
+  "reason": "PRICE_OVER_BUDGET",
+  "message": "The target price exceeds the per-job downstream spend limit"
+}
+```
+
+`preflightId` is `null` when Selo refused the request before it recorded a preflight: for a URL that breaks the URL rules (invalid, not `https`, or a blocked hostname or port), or for an unknown authorization id. Every other rejection is recorded and carries its id.
+
+`GET /v1/preflight/<pfl id>` returns the stored eligible or ineligible view of any preflight.
+
+## Rejection reasons
+
+| Reason | HTTP | Message | What to do |
+| --- | --- | --- | --- |
+| `AUTHORIZATION_MISSING` | 403 | No verified authorization covers this target origin, route and method | Check the `auth_…` id, then authorize the exact URL path and method you are testing |
+| `AUTHORIZATION_EXPIRED` | 403 | The authorization is not verified or has expired; verify it again | Run `selo auth verify` for a pending authorization, or [re-authorize](/guides/authorize-endpoint#re-authorize) an expired one |
+| `TARGET_URL_INVALID` | 400 | The target URL is not a valid absolute URL | Pass a full `https://host/path` URL without credentials |
+| `TARGET_NOT_HTTPS` | 400 | Only https targets can be tested | Serve the route over HTTPS |
+| `TARGET_ADDRESS_BLOCKED` | 422 | The target must be a public hostname on the default https port | Use a public hostname on port 443. This also fires when the hostname resolves to a private, loopback, link-local or other non-public address |
+| `METHOD_NOT_ALLOWED` | 422 | The method is not allowed for this target | Defined in the contract; the current preflight does not return it. A method other than `GET` or `POST` is rejected as `400 VALIDATION_FAILED` |
+| `TARGET_UNREACHABLE` | 422 | The target could not be reached or answered with a server error | The probe timed out after 10 seconds, the connection failed, or your endpoint answered `5xx`. Check that it is up and reachable from the internet |
+| `NO_PAYMENT_CHALLENGE` | 422 | The target did not answer the unpaid request with a valid x402 challenge | Your endpoint answered something other than `402` (including `2xx` and redirects), or a `402` without a `PAYMENT-REQUIRED` header, with a header that does not decode, with an x402 version other than 2, with an amount that is not a positive integer, or with an invalid `payTo` |
+| `NETWORK_NOT_SUPPORTED` | 422 | The target offers no exact payment on the Algorand network Selo pays on | Offer an `exact` requirement on Algorand Mainnet (`algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=`). A Testnet-only endpoint lands here |
+| `ASSET_NOT_SUPPORTED` | 422 | The target offers no exact payment in USDC on the Algorand network | Price the requirement in USDC, ASA `31566704` |
+| `PRICE_OVER_BUDGET` | 422 | The target price exceeds the per-job downstream spend limit | Lower the price of the tested route to at most 0.50 USDC, for example on a staging route |
+
+Other errors use the standard error body, with an `error` code and a `message`:
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `VALIDATION_FAILED` | 400 | The body is malformed: an unknown field, a `requestBody` on a `GET`, a top-level `null` body, or a body over 16 KiB |
+| `PAYLOAD_TOO_LARGE` | 413 | The whole request is over 64 KiB |
+| `NOT_FOUND` | 404 | `GET /v1/preflight/<id>` for an id that does not exist |
+
+## Exit codes
+
+| Exit | When |
+| --- | --- |
+| `0` | Eligible |
+| `3` | Ineligible, printed as `ineligible (<REASON>): <message>`, or any other `4xx` |
+| `2` | Selo answered `5xx` or could not be reached |
+
+## Validity
+
+A preflight is valid for 15 minutes. After that, `POST /v1/release-test` answers `409 PREFLIGHT_EXPIRED` before any payment is taken, and you run a new preflight. The paid route also re-checks the preflight before it asks for payment: an unknown id is `404 PREFLIGHT_NOT_FOUND`, an ineligible one is `422 PREFLIGHT_INELIGIBLE`, an authorization that is no longer verified is `403 AUTHORIZATION_INVALID`, and a price above the job budget is `422 PRICE_OVER_BUDGET`. See [Pay with any x402 client](/guides/any-x402-client).
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="My endpoint answers 200 to the unpaid request">
+    Selo expects a paid route to answer an unpaid request with `402`. A `200` means the route is not protected, and the preflight is `NO_PAYMENT_CHALLENGE`. Check that your x402 middleware covers the exact path and method you are testing.
+  </Accordion>
+  <Accordion title="My endpoint redirects, for example from http to https or to a trailing slash">
+    Preflight does not follow redirects, so the redirect itself is the answer and the preflight is `NO_PAYMENT_CHALLENGE`. Authorize and test the final URL.
+  </Accordion>
+  <Accordion title="My 402 offers several networks">
+    That is fine. Selo picks the `exact` requirement on Algorand Mainnet in USDC and ignores the others.
+  </Accordion>
+  <Accordion title="My POST route rejects the unpaid request because of the body">
+    The probe carries the body you give with `--body` or `requestBody`. Send the same body your clients send, so the route reaches its payment check.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Write a release contract" icon="file-contract" href="/guides/release-contract">
+    Declare what a paid response must look like.
+  </Card>
+  <Card title="Run a release test" icon="flask" href="/guides/run-release-test">
+    Pay once and gate on the verdict.
+  </Card>
+</CardGroup>

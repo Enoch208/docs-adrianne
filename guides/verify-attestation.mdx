@@ -1,0 +1,274 @@
+---
+title: "Verify a signed verdict"
+description: "Check offline that Selo signed a verdict, and that it is for the release, URL and method you are about to ship."
+icon: "certificate"
+---
+
+Selo's answer to a release test carries an attestation: the verdict, the checks and both payment legs, signed by Selo with Ed25519. The public API at `https://api.useselo.xyz` signs every answer. `selo verify` checks that signature against keys you trust and checks that the attestation is for the exact release and target you expect. A PASS for one commit cannot open the gate for another.
+
+## Prerequisites
+
+- An attestation file, saved by `selo test --attestation <file>`. See [Run a release test](/guides/run-release-test).
+- A checkout of the Selo repository with `pnpm install --frozen-lockfile`. No wallet is needed, and verification never pays.
+- Selo's attestation keys: the live URL `https://api.useselo.xyz/.well-known/selo-attestation-keys.json`, or a copy you committed.
+
+## Verify with the CLI
+
+<Steps>
+  <Step title="Get the keys">
+    ```bash Terminal
+    curl -s https://api.useselo.xyz/.well-known/selo-attestation-keys.json
+    ```
+
+    ```json Output
+    {"keys":[{"keyId":"selo-ed25519-728fcf85650b128f","algorithm":"Ed25519","publicKey":"IiUpeUTzfsbOg5-hV6i3eLnqU4uJ7hog31HmgXoc0ZQ"}]}
+    ```
+
+    `publicKey` is the raw Ed25519 public key in base64url. The key id is `selo-ed25519-` followed by the first 16 hex characters of the SHA-256 of the raw key bytes. For CI, save this file once, review it and commit it, for example as `selo/attestation-keys.json`. Trusting a pinned file is stronger than trusting whatever a URL serves at the time.
+  </Step>
+  <Step title="Run selo verify">
+    ```bash Terminal
+    pnpm selo verify \
+      --attestation selo-attestation.json \
+      --keys selo/attestation-keys.json \
+      --release "$(git rev-parse HEAD)" \
+      --url https://api.example.com/v1/orders --method POST
+    ```
+
+    | Flag | Required | Meaning |
+    | --- | --- | --- |
+    | `--attestation` | yes | The attestation file |
+    | `--keys` | yes | The trusted keys: an `https` URL, or a JSON file. A plain `http` URL is refused |
+    | `--release` | yes | The release id you expect the attestation to name |
+    | `--url` | yes | The `https` URL you expect it to name |
+    | `--method` | yes | `GET` or `POST` |
+  </Step>
+  <Step title="Read the result">
+    Verifying the `fixed-v2` attestation from the demo merchant's Mainnet run against the published key prints:
+
+    ```text Output
+    verified    signature by selo-ed25519-728fcf85650b128f (issuer https://api.useselo.xyz)
+    release     fixed-v2 (asserted by the caller when tested)
+    target      POST https://demo.useselo.xyz/v1/orders
+    job         job_51AZ2WJZ78RF1WZC316Q1K38GG
+    verdict     PASS
+    inbound     EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA
+    downstream  QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ
+    ```
+
+    It exits `0`, the attested PASS.
+  </Step>
+</Steps>
+
+You can reproduce this from a checkout of the Selo repository, which commits both Mainnet attestations and the key:
+
+```bash Terminal
+pnpm selo verify \
+  --attestation docs/evidence/g5-release-gate-fixed-v2-attestation.json \
+  --keys docs/evidence/selo-attestation-keys.json \
+  --release fixed-v2 --url https://demo.useselo.xyz/v1/orders --method POST
+```
+
+The same file presented for another release is refused with exit `2`:
+
+```text Output
+not verified: it attests release fixed-v2, not broken-v1
+```
+
+## What is checked
+
+`selo verify` checks, in this order, and stops at the first failure:
+
+| Check | Refused with |
+| --- | --- |
+| The keys can be read and are a Selo key set (`keys` with `keyId`, `algorithm: "Ed25519"` and `publicKey`) | `not verified: could not read the keys at <url>`, `not verified: <url> is not a Selo key set`, or `not verified: <file> is not a readable Selo key set` |
+| The file is an envelope with a `payload` and an Ed25519 `signature` | `not verified: the file is not a Selo release attestation` |
+| The signature's key id is among the trusted keys | `not verified: it is signed by <keyId>, which is not among the trusted keys` |
+| The signature verifies over the payload | `not verified: the signature does not verify; the attestation was altered or forged` |
+| The payload's `schemaVersion` is `selo.release.v1` | `not verified: unsupported schema <version>` |
+| `deployment.id` equals `--release` | `not verified: it attests release <id>, not <release>` |
+| `testedTarget.url` and `testedTarget.method` equal `--url` and `--method` | `not verified: it attests <method> <url>, not <method> <url>` |
+
+The signature is Ed25519 over the payload's canonical JSON: object keys sorted at every level and no whitespace. It covers the payload only, never itself. `--url` is normalized the same way as when you tested, so pass the URL you passed to `selo test`.
+
+<Note>
+  `deployment.id` is the `--release` you gave `selo test`, recorded with `verification: "asserted_by_client"`. Selo signs that you named this release when you tested; it does not check which build was deployed at that URL.
+</Note>
+
+## Exit codes
+
+| Exit | When |
+| --- | --- |
+| `0` | Verified, and the attested verdict is PASS |
+| `1` | Verified, and the attested verdict is FAIL |
+| `2` | Verified with an INCONCLUSIVE verdict, or not verified for any reason in the table above |
+| `3` | Invalid input: a missing flag, a malformed release id or URL, a method other than `GET` or `POST`, or an `http` keys URL |
+
+A promotion step should require exit `0`. Exit `1` is still a successful verification: Selo did sign a FAIL for that release.
+
+## What an attestation contains
+
+This is the payload of the `fixed-v2` attestation, abridged to its first two checks and evidence rows. The full file is `docs/evidence/g5-release-gate-fixed-v2-attestation.json` in the Selo repository.
+
+```json selo-attestation.json
+{
+  "payload": {
+    "schemaVersion": "selo.release.v1",
+    "issuer": "https://api.useselo.xyz",
+    "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+    "testedTarget": { "url": "https://demo.useselo.xyz/v1/orders", "method": "POST" },
+    "deployment": { "id": "fixed-v2", "verification": "asserted_by_client" },
+    "testedAt": "2026-10-26T10:24:02.883Z",
+    "completedAt": "2026-10-26T10:24:12.218Z",
+    "seloVersion": "71080ad",
+    "verdict": "PASS",
+    "inconclusiveReason": null,
+    "checks": [
+      { "id": "handshake", "status": "PASS", "code": "HANDSHAKE_VALID", "blocking": true, "evidence": ["evd_B23GQN052SFAET2QME89MVYX5G"] },
+      { "id": "paid_delivery", "status": "PASS", "code": "PAID_AND_DELIVERED", "blocking": true, "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"] }
+    ],
+    "expectedContractSha256": "6e5b149b1088d214be6a1c097e2e06bf1127fe529c544731023abea7b03e7170",
+    "targetChallengeSha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc",
+    "payments": {
+      "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+      "asset": "31566704",
+      "inboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+      "inboundAmountUsdc": "1.00",
+      "downstream": [
+        { "status": "SETTLED", "amountUsdc": "0.01", "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ" }
+      ]
+    },
+    "evidenceSha256": "49d787f15e7001a408f495aa59f4b16214dca58838e9e99ddd4790f6d6565a96",
+    "evidence": [
+      { "id": "evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "kind": "paid_response", "sha256": "7815cd18d10df182be8f325d6d7a3b67800060da3efeff5c9c01fd409794398b" },
+      { "id": "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R", "kind": "replay_response", "sha256": "a72223caf72ed2bd2d24114062b7cb15655f0d0e9c8cd4442a3bac9e791cae85" }
+    ]
+  },
+  "signature": {
+    "algorithm": "Ed25519",
+    "keyId": "selo-ed25519-728fcf85650b128f",
+    "value": "E3lC29kTmj4Ts8SVoEDFabdAGGAO7ZZs4n9p2P7HUWGePMfi4aO75xQ-v7cynT1T4nT6mB2iQZYAzXe2YIbeBg"
+  }
+}
+```
+
+<Warning>
+  An abridged payload no longer matches its signature. Always verify the complete file.
+</Warning>
+
+| Field | What it lets you check |
+| --- | --- |
+| `testedTarget`, `deployment` | The URL, method and release the verdict is for |
+| `verdict`, `inconclusiveReason`, `checks` | The verdict and each check's status, code, blocking flag and evidence ids |
+| `expectedContractSha256` | The SHA-256 of the release contract the response was checked against. See [Write a release contract](/guides/release-contract#which-contract-did-a-verdict-use) |
+| `targetChallengeSha256` | The SHA-256 of your endpoint's 402 challenge as Selo saw it |
+| `payments` | Both payment legs: your payment to Selo (`inboundTxId`) and each payment Selo made to the target, with status and amount. Look them up at `https://allo.info/tx/<txId>` |
+| `evidence`, `evidenceSha256` | The manifest of evidence rows with their hashes, and a hash of the manifest |
+
+The attestation holds no secret, no request body and no report token. It is safe to publish. See [Signed attestations](/concepts/attestations) for the full schema.
+
+## Verify in CI before promotion
+
+Use the GitHub Action in `verify` mode as the gate of the promote job. The Selo repository's `Release gate demo` workflow does exactly this with the committed Mainnet attestations:
+
+```yaml .github/workflows/release-gate-demo.yml
+- name: Verify the attestation for this release against Selo's pinned key
+  id: selo
+  uses: ./.github/actions/release-gate
+  with:
+    mode: verify
+    attestation: docs/evidence/g5-release-gate-${{ inputs.release }}-attestation.json
+    keys: docs/evidence/selo-attestation-keys.json
+    release: ${{ inputs.release }}
+    url: https://demo.useselo.xyz/v1/orders
+    method: POST
+```
+
+The promote job runs only when the gate output is `ALLOW`. On 26 October 2026 the `broken-v1` run [failed the gate and skipped promotion](https://github.com/Enoch208/selo/actions/runs/40308497965), and the `fixed-v2` run [passed and promoted](https://github.com/Enoch208/selo/actions/runs/40308508699). See [Gate deploys in GitHub Actions](/guides/github-actions).
+
+## Verify without Selo's code
+
+The format is plain enough to check with Node's standard library alone. This script performs the core checks of `selo verify`: trusted key, signature, schema version, release, URL and method.
+
+```js verify-attestation.mjs
+import { createPublicKey, verify } from "node:crypto";
+import { readFileSync } from "node:fs";
+
+const [attestationFile, keysFile, release, url, method] = process.argv.slice(2);
+const { payload, signature } = JSON.parse(readFileSync(attestationFile, "utf8"));
+const { keys } = JSON.parse(readFileSync(keysFile, "utf8"));
+
+const ordered = (value) =>
+  Array.isArray(value)
+    ? value.map(ordered)
+    : value !== null && typeof value === "object"
+      ? Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map((key) => [key, ordered(value[key])]),
+        )
+      : value;
+
+const key = keys.find((candidate) => candidate.keyId === signature.keyId);
+if (!key) throw new Error(`signed by ${signature.keyId}, which is not trusted`);
+
+const publicKey = createPublicKey({
+  key: { kty: "OKP", crv: "Ed25519", x: key.publicKey },
+  format: "jwk",
+});
+const signed = verify(
+  null,
+  Buffer.from(JSON.stringify(ordered(payload))),
+  publicKey,
+  Buffer.from(signature.value, "base64url"),
+);
+if (!signed) throw new Error("the signature does not verify");
+if (payload.schemaVersion !== "selo.release.v1") throw new Error("unsupported schema");
+if (payload.deployment?.id !== release) throw new Error("another release");
+if (payload.testedTarget.url !== url || payload.testedTarget.method !== method) {
+  throw new Error("another target");
+}
+console.log(`${payload.verdict} for ${release}, job ${payload.jobId}`);
+```
+
+```bash Terminal
+node verify-attestation.mjs g5-release-gate-fixed-v2-attestation.json selo-attestation-keys.json \
+  fixed-v2 https://demo.useselo.xyz/v1/orders POST
+```
+
+```text Output
+PASS for fixed-v2, job job_51AZ2WJZ78RF1WZC316Q1K38GG
+```
+
+Change any signed field, such as the `verdict` of the `broken-v1` attestation from `FAIL` to `PASS`, and the script stops with `the signature does not verify`.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="not verified: it is signed by …, which is not among the trusted keys">
+    Your pinned key file does not contain the key that signed this attestation. Compare it with `https://api.useselo.xyz/.well-known/selo-attestation-keys.json`. If Selo published a new key, review it and add it to your file deliberately.
+  </Accordion>
+  <Accordion title="not verified: it attests release …, not …">
+    The attestation is for another release id. In CI, make sure `release` is the same value in the `test` and the `verify` steps, for example `${{ github.sha }}` in both.
+  </Accordion>
+  <Accordion title="not verified: it attests POST https://…, not GET https://…">
+    The URL or method differs from the tested target. Pass exactly the URL and method you tested.
+  </Accordion>
+  <Accordion title="not verified: the file is not a Selo release attestation">
+    The file is missing, is not JSON, or is not an envelope with `payload` and `signature`. Check the path; in CI, check that the artifact was downloaded. The summary file `selo-gate.json` is not an attestation.
+  </Accordion>
+  <Accordion title="The run said attestation none">
+    Selo's answer carried no attestation for that run, so there is nothing to verify. Do not promote on the summary alone.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Signed attestations" icon="signature" href="/concepts/attestations">
+    The attestation model and every payload field.
+  </Card>
+  <Card title="selo verify reference" icon="terminal" href="/cli/verify">
+    Every flag and exit code.
+  </Card>
+</CardGroup>
