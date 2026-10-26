@@ -1,47 +1,289 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Your first release test"
+sidebarTitle: "Quickstart"
+description: "Authorize your x402 endpoint, run a free preflight, and let Selo pay it on Algorand Mainnet to get a PASS, FAIL or INCONCLUSIVE verdict."
+icon: "rocket"
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide takes you from a fresh checkout to a signed verdict on your own x402 endpoint. You pay Selo 1.00 USDC once, Selo pays your endpoint as a real x402 client, and the `selo` CLI exits with a code your pipeline can trust.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Warning>
+  A release test makes a real payment to your endpoint. Selo sends **one paid request** and **one replay** of the identical signed payment and body. If your paid route has side effects (an order, a message, a charge), point Selo at a staging route or a test SKU.
+</Warning>
 
 ## Prerequisites
 
-Before you begin, you must have:
+- **An x402 endpoint you own on Algorand Mainnet.** It must answer an unpaid request with an x402 v2 `402` that offers an `exact` USDC payment (ASA `31566704`), and it must be served over public HTTPS on the default port. Selo tests `GET` and `POST` routes priced at up to 0.50 USDC.
+- **A way to publish a file at your origin.** You serve one line at `https://<your origin>/.well-known/selo-verification.txt` to prove you own the route.
+- **A Mainnet payer wallet.** An Algorand account opted in to USDC (ASA `31566704`) that holds at least 1.00 USDC per release test, plus enough ALGO for the account's minimum balance and the opt-in transaction. Use a dedicated wallet that holds only what a few release tests cost.
+- **Node 24 and pnpm 10.**
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+<Info>
+  Authorization and preflight are free. You pay only for the release test itself: 1.00 USDC to Selo. Selo pays your endpoint's price from its own wallet. See [Pricing and limits](/resources/pricing-and-limits).
+</Info>
 
-## Get started
+## Run it
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone and install">
+    The CLI runs from a checkout of the Selo repository.
 
-    ```bash
-    npm install your-package
+    ```bash Terminal
+    git clone https://github.com/Enoch208/selo.git
+    cd selo
+    pnpm install --frozen-lockfile
+    pnpm selo --help
+    ```
+
+    `pnpm selo …` works from anywhere inside the checkout. Relative file paths resolve from the directory you run it in.
+
+    Set two variables for the rest of this guide. Replace the URL with your own paid route:
+
+    ```bash Terminal
+    API=https://api.useselo.xyz
+    URL=https://api.example.com/v1/orders
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
+  <Step title="Authorize your endpoint">
+    Ask Selo for a verification challenge for the exact URL and method:
+
+    ```bash Terminal
+    pnpm selo auth create --api $API --url $URL --method POST --project <name> --contact <email>
     ```
+
+    The CLI prints the authorization id (`auth_…`, status `PENDING`), the URL to serve, the line to serve, and the verify command to run next. The line looks like `selo-verification=` followed by a random token.
+
+    Serve that line at `https://<your origin>/.well-known/selo-verification.txt`. The file may hold several lines, must answer with a 2xx status and must be at most 4,096 bytes. Then verify:
+
+    ```bash Terminal
+    pnpm selo auth verify --api $API --authorization auth_…
+    ```
+
+    On success the CLI prints `authorization auth_…: VERIFIED`, the method and route it covers, and when it expires, and exits `0`. An authorization is valid for 24 hours after verification. You have 1 hour to verify a new challenge before it expires.
+
+    <Tip>
+      Check the status at any time with `pnpm selo auth status --api $API --authorization auth_…`. More detail in [Authorize your endpoint](/guides/authorize-endpoint).
+    </Tip>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
+  <Step title="Run a free preflight">
+    A preflight makes one unpaid request to your endpoint, reads its `402`, and tells you what the test will cost before anyone pays.
+
+    ```bash Terminal
+    pnpm selo preflight --api $API --authorization auth_… --url $URL --method POST --body body.json
     ```
+
+    `--body` is a JSON file with the request body to send. It is allowed only with `--method POST`; omit it for `GET`.
+
+    An eligible preflight prints:
+
+    | Line         | What it tells you                                               |
+    | ------------ | --------------------------------------------------------------- |
+    | `preflight`  | The preflight id (`pfl_…`) and when it expires (15 minutes)     |
+    | `target`     | The method and URL Selo will pay                                |
+    | `target fee` | Your endpoint's price, paid by Selo                             |
+    | `Selo cap`   | The most Selo will spend on your endpoint in this test          |
+    | `you pay`    | Selo's price for the release test, 1.00 USDC                    |
+
+    If the target is not eligible, the CLI prints `ineligible (<reason>)` with a message and exits `3`. Nothing is paid. The reasons are listed in [Run a preflight](/guides/preflight).
+
+    <Note>
+      You do not have to keep this preflight id. `selo test` runs its own fresh preflight on every run.
+    </Note>
+  </Step>
+
+  <Step title="Write your release contract">
+    Declare what a paid response must look like. Write `contract.json` with the status, content type and JSON Schema that your paid route actually returns:
+
+    ```json contract.json
+    {
+      "status": 200,
+      "contentType": "application/json",
+      "jsonSchema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": { "id": { "type": "string" } }
+      }
+    }
+    ```
+
+    All three fields are optional. The schema is compiled in strict mode before anything is paid: every name in `required` must also appear under `properties`, or the CLI exits `3`. See [Write a release contract](/guides/release-contract).
+  </Step>
+
+  <Step title="Run the paid release test">
+    Export the payer wallet's 25-word mnemonic in `SELO_PAYER_MNEMONIC` and run the test. The CLI never prints the mnemonic or writes it to disk.
+
+    ```bash Terminal
+    SELO_PAYER_MNEMONIC="…" pnpm selo test --api $API --authorization auth_… --url $URL --method POST \
+      --body body.json --contract contract.json --release <your git sha> \
+      --network mainnet --max-usdc 1.00 --approve-mainnet \
+      --pay-to N37HMJCB4BAITC2ZU7C4XW7PUMCO4T3TUASHQEL6A4EWMLOTTHOB7IOOKY \
+      --summary selo-gate.json --attestation selo-attestation.json
+    ```
+
+    The Mainnet flags are required and deliberate:
+
+    | Flag                     | Why                                                                                                                                  |
+    | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+    | `--network mainnet`      | The CLI refuses a `402` on any other network                                                                                         |
+    | `--max-usdc 1.00`        | Your budget for paying Selo. The CLI refuses to sign if Selo's price is higher                                                       |
+    | `--approve-mainnet`      | Your explicit approval of a Mainnet payment. Without it, a Mainnet run exits `3` before paying                                       |
+    | `--pay-to <address>`     | Selo's payee. The CLI refuses to sign if Selo's live `402` names a different address. The value above is the payTo in Selo's Mainnet `402` |
+    | `--release <id>`         | The build you are testing, for example a Git SHA. 1 to 128 characters of `A-Z`, `a-z`, `0-9`, `.`, `_` or `-`                          |
+
+    Before signing, the CLI prints the terms: your release, the target, the preflight, the target fee, Selo's cap, what you pay and on which network, your approved budget and the payer address. It then prints the price, network, payTo and tag read from Selo's live `402`. It pays once and never retries a payment on its own. Every flag is documented in [selo test](/cli/test).
+  </Step>
+
+  <Step title="Read the result">
+    After the report comes back, the terminal shows:
+
+    - `verdict`: PASS, FAIL or INCONCLUSIVE.
+    - One `check` line per release check, with its status and code, for example `response_contract FAIL SCHEMA_MISMATCH`.
+    - Any `warning` lines.
+    - `job`: the job id (`job_…`).
+    - `inbound`: the transaction where you paid Selo.
+    - `downstream`: the transaction where Selo paid your endpoint.
+    - `report`: the private report link, redacted. The full link is kept only in `.selo/runs/<release>.json`.
+    - `gate`: `ALLOW` or `BLOCK`, the exit code and the reason, for example `gate ALLOW (exit 0): PASS on every release check` or `gate BLOCK (exit 1): FAIL: response_contract`.
+
+    Check the exit code:
+
+    ```bash Terminal
+    echo $?
+    ```
+
+    | Exit | Verdict      | Meaning                                                                                                                     |
+    | ---- | ------------ | --------------------------------------------------------------------------------------------------------------------------- |
+    | `0`  | PASS         | No check failed or was left unproven, every check has evidence, and both payment legs are in the report. A WARN is printed but does not block |
+    | `1`  | FAIL         | A release check proved a defect. The `gate` line names the check                                                            |
+    | `2`  | INCONCLUSIVE | Something could not be proven: an outage, an unconfirmed payment, or a missing or inconsistent report. Not a PASS            |
+    | `3`  | none         | Refused before paying: invalid input, missing authorization, ineligible preflight, or payment not approved                  |
+
+    Look both transactions up on an Algorand explorer at `https://allo.info/tx/<txId>`. The inbound one always comes first.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Files the run leaves behind
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+| File                           | What it holds                                                                                                                                | Safe to share |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| `selo-gate.json`               | The `selo.gate.v1` summary: release, target, gate, exit code, verdict, every check, both transaction ids and the job id. The report link is redacted | Yes           |
+| `selo-attestation.json`        | Selo's Ed25519-signed attestation of the verdict, the checks and both payments                                                               | Yes           |
+| `.selo/runs/<release>.json`    | The local run state, including the full private report link. Written with mode 600                                                           | No            |
+
+Here is the summary from a real Mainnet run against the [demo merchant](/guides/demo-merchant):
+
+<Accordion title="selo-gate.json from the fixed-v2 run on 26 October 2026">
+```json selo-gate.json
+{
+  "schema": "selo.gate.v1",
+  "release": {
+    "id": "fixed-v2",
+    "verification": "asserted_by_client"
+  },
+  "target": {
+    "url": "https://demo.useselo.xyz/v1/orders",
+    "method": "POST"
+  },
+  "network": "algorand-mainnet",
+  "gate": "ALLOW",
+  "exitCode": 0,
+  "reason": "PASS on every release check",
+  "verdict": "PASS",
+  "inconclusiveReason": null,
+  "checks": [
+    {
+      "id": "handshake",
+      "status": "PASS",
+      "code": "HANDSHAKE_VALID",
+      "summary": "Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704."
+    },
+    {
+      "id": "paid_delivery",
+      "status": "PASS",
+      "code": "PAID_AND_DELIVERED",
+      "summary": "Downstream payment settled and target returned 200 with transaction QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ."
+    },
+    {
+      "id": "response_contract",
+      "status": "PASS",
+      "code": "CONTRACT_MATCHED",
+      "summary": "Observed response matched the expected status 200 and content type application/json."
+    },
+    {
+      "id": "discovery_contract",
+      "status": "PASS",
+      "code": "DISCOVERY_CONSISTENT",
+      "summary": "Live challenge and catalog record agree on method, URL, payment terms and carry usable metadata."
+    },
+    {
+      "id": "retry_safety",
+      "status": "PASS",
+      "code": "PASS_REPLAY_REJECTED",
+      "summary": "Replaying the identical signed payment header was rejected with status 402."
+    }
+  ],
+  "warnings": [],
+  "money": {
+    "seloInboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+    "downstreamTxIds": ["QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"],
+    "downstreamSpendUsdc": "0.01"
+  },
+  "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+  "report": "https://api.useselo.xyz/v1/reports/<private>",
+  "decidedAt": "2026-10-26T10:24:14.275Z"
+}
+```
+</Accordion>
+
+<Warning>
+  Never upload or commit the `.selo/` directory. It holds the private report link.
+</Warning>
+
+## Verify the signed verdict
+
+Anyone can check the attestation offline against Selo's published keys. `selo verify` exits with the attested verdict and refuses an attestation for any other release, URL or method:
+
+```bash Terminal
+pnpm selo verify --attestation selo-attestation.json \
+  --keys https://api.useselo.xyz/.well-known/selo-attestation-keys.json \
+  --release <your git sha> --url $URL --method POST
+```
+
+For CI, download the key set once, review it and commit it, then pass the file to `--keys` instead of the URL. See [Verify a signed verdict](/guides/verify-attestation).
+
+## Troubleshooting
+
+| You see                                                                     | Cause                                                                    | What to do                                                                                                     |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `VERIFICATION_FAILED` from `auth verify`                                    | The well-known file is missing, not 2xx, or lacks the line               | Serve the exact `selo-verification=…` line at `/.well-known/selo-verification.txt` and verify again            |
+| `CHALLENGE_EXPIRED` from `auth verify`                                      | More than 1 hour passed since `auth create`                              | Run `auth create` again                                                                                        |
+| `--network mainnet needs --approve-mainnet and --pay-to …`, exit `3`        | A Mainnet run without the approval flags                                 | Add both flags once you approve the payment                                                                    |
+| `SELO_PAYER_MNEMONIC is not set`, exit `3`                                  | The payer wallet is not in the environment                               | Export the dedicated payer wallet's mnemonic                                                                   |
+| `preflight ineligible (AUTHORIZATION_EXPIRED)`, exit `3`                    | Authorizations last 24 hours                                             | Repeat the authorize step                                                                                      |
+| `preflight ineligible (PRICE_OVER_BUDGET)`, exit `3`                        | Your endpoint costs more than 0.50 USDC                                  | Test a route priced at 0.50 USDC or less                                                                       |
+| `the contract file … is not usable`, exit `3`                               | The JSON Schema does not compile in strict mode                          | Make sure every name in `required` appears under `properties`                                                  |
+| `above the approved budget`, exit `3`                                       | Selo's price is above `--max-usdc`                                       | Check the price with `pnpm selo preflight`, then raise `--max-usdc` deliberately                               |
+| `Selo did not accept the payment, nothing was charged`, exit `3`            | The payer lacks USDC or is not opted in                                  | Fund the payer and opt it in to ASA `31566704`                                                                 |
+| `discovery_contract INCONCLUSIVE CATALOG_UNAVAILABLE`, exit `2`             | The Bazaar catalog could not be read                                     | Selo will not call it PASS without that proof. Run again later                                                 |
+| An "unconfirmed paid run" message, exit `2`                                 | The response was lost after the payment was sent                         | Do **not** start a new run. Rerun the same command with `--resume` while the preflight is valid (15 minutes) |
+
+Interrupted runs are covered in detail in [Recover an interrupted run](/guides/resume).
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Gate deploys in GitHub Actions" icon="code-branch" href="/guides/github-actions">
+    Run the free preflight on every build and promote only a signed PASS.
+  </Card>
+  <Card title="How Selo works" icon="diagram-project" href="/how-it-works">
+    The two payment legs, the order they happen in, and how the verdict is decided.
+  </Card>
+  <Card title="The five release checks" icon="list-check" href="/concepts/checks">
+    What each check proves and every code it can return.
+  </Card>
+  <Card title="Try the demo merchant" icon="store" href="/guides/demo-merchant">
+    See a healthy endpoint fail its contract, then pass after the fix.
+  </Card>
+</CardGroup>

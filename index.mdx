@@ -1,20 +1,81 @@
 ---
 title: "Introduction"
-description: "Welcome to your project"
+description: "Selo is CI for x402. It pays your endpoint before your users do."
+icon: "house"
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Selo is a release gate for paid x402 APIs on Algorand. Before you ship, Selo becomes your customer: it pays your endpoint for real on Algorand Mainnet, checks what comes back against the contract you declare, and lets the release out only on a proven, signed **PASS**.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+## Why a paid endpoint needs its own gate
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+A paid endpoint can pass every health check and still break for the people who pay for it. The payment settles, the server answers `200`, and the response is missing a field every buyer depends on. Uptime checks, unit tests and integration tests never pay, so they never see what a paying customer sees.
+
+Selo tests the one path they skip: the paid request itself.
+
+## What a release test does
+
+<Steps>
+  <Step title="You authorize your endpoint">
+    You prove you own the route by serving a one-line token from your own domain. Selo never tests a route that is not authorized.
+  </Step>
+  <Step title="You pay Selo over x402">
+    One command pays Selo 1.00 USDC through a standard x402 payment. Nothing else happens until that payment has settled on chain.
+  </Step>
+  <Step title="Selo pays your endpoint as a real client">
+    Selo reads your `402`, pays your price from its own wallet, and replays the identical signed payment to test retry safety. Spend is capped per job.
+  </Step>
+  <Step title="Five checks, one verdict">
+    Selo runs five release checks and reduces them to a deterministic **PASS**, **FAIL** or **INCONCLUSIVE**. Unknown is never PASS.
+  </Step>
+  <Step title="The gate decides">
+    The `selo` CLI exits `0` only on a fully evidenced PASS. Your terminal or GitHub Actions blocks the release on anything else. Every verdict is Ed25519-signed, so anyone can verify it offline.
+  </Step>
+</Steps>
+
+## Proven on Algorand Mainnet
+
+On 26 October 2026 a demo merchant at `https://demo.useselo.xyz/v1/orders` went through the gate twice:
+
+| Release | What happened | Verdict | Gate |
+| --- | --- | --- | --- |
+| `broken-v1` | Health `200`, payment settled, response `200`, receipt missing `receiptId` | **FAIL** on `response_contract` | Blocked, exit `1` |
+| `fixed-v2` | Same URL, paid again | **PASS** on all five checks | Allowed, exit `0` |
+
+Both runs carry both payment legs on chain and a signed attestation. See [Proof on Algorand Mainnet](/resources/mainnet-proof) for every transaction.
+
+## Start here
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Authorize an endpoint and run your first release test.
+  </Card>
+  <Card title="How Selo works" icon="diagram-project" href="/how-it-works">
+    The two payment legs, the five checks and the verdict.
+  </Card>
+  <Card title="Gate deploys in GitHub Actions" icon="github" href="/guides/github-actions">
+    Block a release unless Selo returns a signed PASS.
+  </Card>
+  <Card title="Use Selo from a coding agent" icon="robot" href="/agents">
+    One instruction for your agent; you keep the wallet and the approval.
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/cli/overview">
+    Every command, flag, file and exit code.
+  </Card>
+  <Card title="API reference" icon="code" href="/api-reference/introduction">
+    Call the Selo API directly from any x402 client.
+  </Card>
+</CardGroup>
+
+## Supported today
+
+| | |
+| --- | --- |
+| Network and asset | Algorand Mainnet, USDC (ASA `31566704`) |
+| Methods | `GET` and `POST` with a JSON body |
+| Profile | `quick`: one paid request and one replay of the identical signed payment |
+| Selo's price | 1.00 USDC per release test, paid over x402 |
+| Your endpoint's price | Up to 0.50 USDC per job, paid by Selo from its own wallet |
+
+<Note>
+  The verdict is computed by deterministic code from recorded evidence. The same evidence always produces the same verdict.
+</Note>

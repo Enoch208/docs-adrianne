@@ -1,0 +1,169 @@
+---
+title: "Use Selo from a coding agent"
+sidebarTitle: "Coding agents"
+description: "Hand a release test to Claude Code, Cursor or another coding agent, while the wallet and the Mainnet approval stay with you."
+icon: "robot"
+---
+
+A coding agent can do almost all of a release test for you: clone the CLI, authorize your route, serve the verification file, run the preflight and write the release contract. The two things it must not do on its own are touch the payer wallet and approve the Mainnet payment. The `selo` CLI is built so that both stay with you.
+
+## Give your agent this instruction
+
+Copy the block below into Claude Code, Cursor or any agent that can run shell commands in your project. Replace the three values in angle brackets first.
+
+```text Agent instruction
+Run a Selo release test on my x402 endpoint.
+
+Endpoint: <https URL of my paid route>
+Method:   <GET or POST>
+Contact:  <my email>
+
+Follow the public pilot guide exactly:
+https://raw.githubusercontent.com/Enoch208/selo/main/docs/PILOT_GUIDE.md
+
+Rules:
+1. Clone https://github.com/Enoch208/selo into a separate folder outside my
+   project, run `pnpm install --frozen-lockfile` there (Node 24, pnpm 10), and
+   run every Selo command as `pnpm selo ...` from inside that checkout.
+2. Authorize: run `pnpm selo auth create` for my exact URL and method. Add the
+   printed `selo-verification=...` line to the file my app serves at
+   /.well-known/selo-verification.txt on the same origin (keep any lines
+   already there). Show me the change. Once it is live, confirm it with
+   `curl https://<origin>/.well-known/selo-verification.txt`, then run
+   `pnpm selo auth verify`. It must print VERIFIED.
+3. Run the free `pnpm selo preflight` and show me its full output.
+4. If the method is POST, write body.json with a valid request body for the
+   route. Write contract.json from the response my paid route really returns:
+   read the handler code and the output example in my 402's Bazaar metadata.
+   Do not invent fields. Every name in "required" must also be in "properties".
+5. STOP before the paid step. Show me the exact `pnpm selo test` command and
+   the prices from the preflight, and wait for my explicit yes. Never add
+   --approve-mainnet unless I have said yes in this conversation.
+6. Never ask for, read, print, log or write my wallet mnemonic. I will set
+   SELO_PAYER_MNEMONIC in my own shell. Do not commit or upload the .selo/
+   folder, and do not paste the private report link anywhere.
+7. After the run, report the verdict, every check with its status and code,
+   the exit code, and both transaction ids as https://allo.info/tx/<txId>
+   links.
+8. If the CLI reports an unconfirmed paid run, do not start a new run. Tell me,
+   and rerun the same command with --resume only after I agree.
+```
+
+<Tip>
+  The pilot guide is plain Markdown, so the agent can read it with any HTTP fetch. It holds the same commands as the [Quickstart](/quickstart).
+</Tip>
+
+## Who does what
+
+| Step                                                       | Your agent | You |
+| ---------------------------------------------------------- | :--------: | :-: |
+| Clone the repository and install                           | Yes        |     |
+| `selo auth create`, serve the verification line, `selo auth verify` | Yes |   |
+| `selo preflight` and read the prices                       | Yes        |     |
+| Write `body.json` and `contract.json`                      | Yes        | Review |
+| Create and fund the payer wallet, opt it in to USDC        |            | Yes |
+| Set `SELO_PAYER_MNEMONIC` in your shell                    |            | Yes |
+| Approve the Mainnet payment (`--approve-mainnet`)          |            | Yes |
+| Run `selo test` and read the verdict                       | After your yes | Approve |
+| Gate CI on the result                                      | Yes        | Review |
+
+## What the CLI enforces
+
+The CLI does not rely on your agent behaving. These rules hold for any caller:
+
+- **No Mainnet payment without approval flags.** `--network mainnet` without both `--approve-mainnet` and `--pay-to` exits `3` before anything is signed. Treat `--approve-mainnet` as your signature: tell your agent it may only add it after you say yes.
+- **No wallet, no payment.** If `SELO_PAYER_MNEMONIC` is unset, `selo test` exits `3`. The mnemonic is read only from that variable and is never printed or written to disk. Signed payments are never printed either.
+- **A budget per run.** `--max-usdc` caps what one run may pay Selo. A higher price is refused before signing.
+- **The right payee and network.** The CLI refuses a `402` on another network than `--network`, or with a payee other than `--pay-to`.
+- **One payment, never retried on its own.** If an outcome is unconfirmed, the CLI records it in `.selo/runs/<release>.json` and refuses to pay again for that release until someone reruns the same command with `--resume`.
+- **Private links stay private.** The report link is redacted in terminal output and in summaries. The full link is kept only in the local run state file, written with mode 600.
+
+See [selo test](/cli/test) for every flag and [Recover an interrupted run](/guides/resume) for `--resume`.
+
+<Warning>
+  Give your agent a dedicated payer wallet that holds only what a few release tests cost, never your main wallet. One release test costs 1.00 USDC.
+</Warning>
+
+## Machine-readable discovery
+
+Agents that find Selo on their own can read two free files from the API. Both are served without payment.
+
+<Tabs>
+  <Tab title="llms.txt">
+    ```bash Terminal
+    curl https://api.useselo.xyz/llms.txt
+    ```
+
+    ```text llms.txt
+    # Selo
+
+    > CI for x402. It pays your endpoint before your users do.
+
+    Run an authorized x402 release test. Selo settles the request, pays the target endpoint, verifies payment and response behavior, and returns an evidence-backed PASS, FAIL, or INCONCLUSIVE report.
+
+    ## Endpoints
+
+    - POST https://api.useselo.xyz/v1/authorizations: request a verification challenge for a target route (free)
+    - POST https://api.useselo.xyz/v1/preflight: check a target is testable and within budget (free)
+    - POST https://api.useselo.xyz/v1/release-test: run the release test (paid with x402, 1.00 USDC on Algorand)
+    - GET https://api.useselo.xyz/v1/reports/%7Btoken%7D: private report
+    ```
+
+    The last line is the report route `GET /v1/reports/{token}`, with the braces URL-encoded.
+  </Tab>
+  <Tab title="agent-card.json">
+    ```bash Terminal
+    curl https://api.useselo.xyz/.well-known/agent-card.json
+    ```
+
+    ```json agent-card.json
+    {
+      "name": "Selo",
+      "description": "CI for x402. It pays your endpoint before your users do. Run an authorized x402 release test. Selo settles the request, pays the target endpoint, verifies payment and response behavior, and returns an evidence-backed PASS, FAIL, or INCONCLUSIVE report.",
+      "url": "https://api.useselo.xyz",
+      "iconUrl": "https://useselo.xyz/brand/selo-logo-512.png",
+      "version": "1.0.0",
+      "provider": {
+        "organization": "Selo",
+        "url": "https://api.useselo.xyz"
+      },
+      "capabilities": {},
+      "defaultInputModes": ["application/json"],
+      "defaultOutputModes": ["application/json"],
+      "skills": [
+        {
+          "id": "x402-release-test",
+          "name": "x402 release test",
+          "description": "Run an authorized x402 release test. Selo settles the request, pays the target endpoint, verifies payment and response behavior, and returns an evidence-backed PASS, FAIL, or INCONCLUSIVE report.",
+          "tags": ["x402", "algorand", "testing", "developer-tools"]
+        }
+      ]
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Paying Selo with any x402 client
+
+The paid route `POST /v1/release-test` answers an unpaid request with a standard x402 v2 `402` challenge. Any x402 client that can pay USDC on Algorand can pay it; the CLI is not required. This is the `accepts` entry from Selo's live `402`, captured on Mainnet:
+
+```json Selo 402 requirement
+{
+  "scheme": "exact",
+  "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+  "amount": "1000000",
+  "asset": "31566704",
+  "payTo": "N37HMJCB4BAITC2ZU7C4XW7PUMCO4T3TUASHQEL6A4EWMLOTTHOB7IOOKY",
+  "maxTimeoutSeconds": 300,
+  "extra": {
+    "name": "USDC",
+    "decimals": 6,
+    "tag": "x402-global-challenge",
+    "feePayer": "ZMFK2OI7ZBD2U27ISERZC4S6LKM6WMFJPZQ4MYNJDZ2VNBNMBA67RA22AA"
+  }
+}
+```
+
+The challenge also carries Bazaar discovery metadata with an example request body and response. Selo returns this `402` only for a request with a valid body that names an eligible, unexpired preflight, so run the free authorization and preflight first.
+
+What the CLI adds on top of a plain x402 client: a fresh preflight, the price and payee checks before signing, a stable `Idempotency-Key`, safe recovery with `--resume`, attestation saving and exit codes for CI. See [Pay with any x402 client](/guides/any-x402-client) for the raw request and the [API overview](/api-reference/introduction) for every route.
