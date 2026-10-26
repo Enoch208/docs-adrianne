@@ -1,0 +1,196 @@
+---
+title: "selo auth"
+description: "Create, verify and inspect the authorization that lets Selo test one URL and method."
+icon: "key"
+---
+
+Selo tests an endpoint only while a verified, unexpired authorization covers its origin, route and method. `selo auth` creates that authorization, verifies it through a file you serve from your own origin, and reports its status. All three subcommands are free.
+
+```text
+selo auth create  --api <url> --url <target> --method GET|POST --project <name> --contact <email>
+selo auth verify  --api <url> --authorization <auth_id>
+selo auth status  --api <url> --authorization <auth_id>
+```
+
+`selo auth` without `create`, `verify` or `status` exits `3` with `selo auth needs create, verify or status`.
+
+<Info>
+For the full walkthrough, including how to serve the file from common hosts, see [Authorize your endpoint](/guides/authorize-endpoint). For the rules Selo applies, see [Authorization](/concepts/authorization).
+</Info>
+
+## selo auth create
+
+Requests a verification challenge for one URL and method. Selo answers with a single line that you serve from your origin to prove you control it.
+
+### Flags
+
+| Flag | Required | Value | Description |
+| --- | --- | --- | --- |
+| `--api` | Yes | `https` URL | Selo's API origin, for example `https://api.useselo.xyz`. `http` is accepted only for `localhost`, `127.0.0.1` and `[::1]`. |
+| `--url` | Yes | `https` URL | The paid endpoint to authorize. The authorization covers its origin and route path. Selo requires a public hostname on the default `https` port. |
+| `--method` | Yes | `GET` or `POST` | The method the authorization covers. Case-insensitive. |
+| `--project` | Yes | text | A name for your project. Selo accepts 1 to 80 characters. |
+| `--contact` | Yes | text | How Selo can reach you, for example an email address. Selo accepts 3 to 200 characters. |
+
+### What it does
+
+The CLI sends `POST /v1/authorizations` with `targetUrl`, `method`, `project` and `contact`. Selo creates a `PENDING` authorization and a one-time verification line. Selo stores only a hash of the token in that line.
+
+### Output
+
+```text Terminal
+$ pnpm selo auth create --api https://api.useselo.xyz \
+    --url https://staging.example.com/v1/orders --method POST \
+    --project shop --contact you@example.com
+authorization auth_…: PENDING
+serve this line at https://staging.example.com/.well-known/selo-verification.txt:
+selo-verification=<token>
+then run: selo auth verify --api https://api.useselo.xyz --authorization auth_…
+```
+
+Serve the `selo-verification=…` line, exactly as printed, at `https://<your origin>/.well-known/selo-verification.txt`. The file may hold several lines, so one origin can carry challenges for several routes. Keep it under 4 KiB: Selo reads no more than that.
+
+<Note>
+The challenge is valid for 1 hour after you create it. Verify within that hour, or create a new one.
+</Note>
+
+### Exit codes
+
+| Exit | When |
+| --- | --- |
+| `0` | Selo created the challenge. |
+| `2` | Selo could not be reached, answered with a `5xx`, or answered with an unexpected shape. |
+| `3` | A flag is missing or invalid, or Selo refused the request with a `4xx`, for example `400 VALIDATION_FAILED` for a project name over 80 characters or `400 TARGET_ADDRESS_BLOCKED` for a target that is not a public hostname on the default port. |
+
+## selo auth verify
+
+Asks Selo to fetch your verification file and, if it carries the line, mark the authorization `VERIFIED`.
+
+### Flags
+
+| Flag | Required | Value | Description |
+| --- | --- | --- | --- |
+| `--api` | Yes | `https` URL | Selo's API origin. |
+| `--authorization` | Yes | `auth_…` | The id printed by `selo auth create`. |
+
+### What it does
+
+The CLI sends `POST /v1/authorizations/<id>/verify`. Selo fetches `https://<origin>/.well-known/selo-verification.txt` from a public address only, trims each line, and looks for a `selo-verification=` line whose token matches the challenge. On a match, the authorization becomes `VERIFIED` and expires 24 hours later.
+
+Verifying an authorization that is already `VERIFIED` returns it unchanged, without fetching the file again. It does not extend the expiry: create a new authorization when it lapses.
+
+### Output
+
+```text Terminal
+$ pnpm selo auth verify --api https://api.useselo.xyz --authorization auth_…
+authorization auth_…: VERIFIED
+covers        POST https://staging.example.com/v1/orders (well_known_file)
+expires       <24 hours after verification>
+```
+
+| Line | Content |
+| --- | --- |
+| `authorization` | The id and its status. |
+| `covers` | The method, origin and route path the authorization covers, and its type. |
+| `expires` | When it lapses, as an ISO 8601 timestamp, or `never set` if Selo returned none. |
+
+When Selo refuses, the CLI prints the HTTP status, the error code and Selo's message on stderr:
+
+```text Terminal
+HTTP 409 VERIFICATION_FAILED: https://staging.example.com/.well-known/selo-verification.txt does not contain the expected selo-verification line
+```
+
+### Errors from Selo
+
+| HTTP | Error code | Cause | Exit |
+| --- | --- | --- | --- |
+| `409` | `VERIFICATION_FAILED` | The file does not carry the line, answered with a non-2xx status, or is larger than 4 KiB. | `3` |
+| `409` | `CHALLENGE_EXPIRED` | The 1-hour challenge lapsed before verification. Create a new one. | `3` |
+| `409` | `AUTHORIZATION_EXPIRED` | The verified authorization lapsed. Create a new one. | `3` |
+| `409` | `AUTHORIZATION_REVOKED` | The authorization was revoked. | `3` |
+| `422` | `TARGET_ADDRESS_BLOCKED`, `REDIRECT_NOT_ALLOWED`, `TOO_MANY_REDIRECTS` or another block reason | Selo refused to fetch the file, for example because the origin resolves to a non-public address or the file redirects where Selo will not follow. The message reads `Selo refused to fetch <url>`. | `3` |
+| `404` | `NOT_FOUND` | No authorization has this id. | `3` |
+| `502` | `VERIFICATION_UNREACHABLE` | Selo could not reach the file. Check that it is served, then retry. | `2` |
+
+See [Errors and reason codes](/api-reference/errors) for the API side.
+
+### Exit codes
+
+| Exit | When |
+| --- | --- |
+| `0` | The authorization is `VERIFIED`. |
+| `2` | Selo could not be reached, answered with a `5xx` such as `VERIFICATION_UNREACHABLE`, or answered with an unexpected shape. |
+| `3` | A flag is missing or invalid, or Selo refused with a `4xx`. |
+
+## selo auth status
+
+Reads an authorization without changing it, except that Selo marks a lapsed authorization `EXPIRED` when you read it.
+
+### Flags
+
+| Flag | Required | Value | Description |
+| --- | --- | --- | --- |
+| `--api` | Yes | `https` URL | Selo's API origin. |
+| `--authorization` | Yes | `auth_…` | The authorization id. |
+
+### Output
+
+The CLI sends `GET /v1/authorizations/<id>` and prints the same three lines as `selo auth verify`:
+
+```text Terminal
+$ pnpm selo auth status --api https://api.useselo.xyz --authorization auth_…
+authorization auth_…: VERIFIED
+covers        POST https://staging.example.com/v1/orders (well_known_file)
+expires       <24 hours after verification>
+```
+
+### Exit codes
+
+| Exit | When |
+| --- | --- |
+| `0` | The authorization is `VERIFIED`. |
+| `2` | Selo could not be reached, answered with a `5xx`, or answered with an unexpected shape. |
+| `3` | The authorization is `PENDING`, `EXPIRED` or `REVOKED` (the three lines are still printed), a flag is missing or invalid, or Selo answered with a `4xx` such as `404 NOT_FOUND`. |
+
+Because only `VERIFIED` exits `0`, you can use `selo auth status` as a cheap pre-check before a paid run.
+
+## Statuses and types
+
+| Status | Meaning | `selo auth status` exit |
+| --- | --- | --- |
+| `PENDING` | The challenge exists and is not verified yet. It lapses 1 hour after creation. | `3` |
+| `VERIFIED` | Selo found your line. Valid for 24 hours after verification. | `0` |
+| `EXPIRED` | The challenge or the authorization lapsed. Create a new one. | `3` |
+| `REVOKED` | The authorization was revoked. | `3` |
+
+| Type | Meaning |
+| --- | --- |
+| `well_known_file` | Verified through `/.well-known/selo-verification.txt`. Every authorization created with `selo auth create` has this type. |
+| `manual_owner_consent` | Recorded by a Selo operator from the owner's explicit consent. The CLI cannot create it, but `selo auth status` shows it. |
+
+## Examples
+
+<CodeGroup>
+
+```bash Authorize a POST route
+API=https://api.useselo.xyz
+URL=https://staging.example.com/v1/orders
+
+pnpm selo auth create --api $API --url $URL --method POST \
+  --project shop --contact you@example.com
+# serve the printed line at https://staging.example.com/.well-known/selo-verification.txt
+pnpm selo auth verify --api $API --authorization auth_…
+```
+
+```bash Check before a release window
+pnpm selo auth status --api https://api.useselo.xyz --authorization auth_… \
+  || echo "authorize again before paying for a release test"
+```
+
+</CodeGroup>
+
+## Related
+
+- [Run a preflight](/guides/preflight): the next step once the authorization is `VERIFIED`.
+- [selo preflight](/cli/preflight) returns `AUTHORIZATION_MISSING` or `AUTHORIZATION_EXPIRED` when the authorization does not cover the target.
+- [CLI overview](/cli/overview) for shared flag rules and exit codes.

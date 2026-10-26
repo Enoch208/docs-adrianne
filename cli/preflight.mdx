@@ -1,0 +1,148 @@
+---
+title: "selo preflight"
+description: "Check for free that Selo can test your endpoint, and see every price, before anything is paid."
+icon: "list-check"
+---
+
+`selo preflight` asks Selo whether your endpoint is eligible for a release test and shows what the test will cost. It is free and needs no wallet. Selo reads your endpoint's 402 with one unpaid request, checks it against your authorization and its own limits, and returns either an eligible preflight or the reason it is not eligible.
+
+```text
+selo preflight --api <url> --authorization <auth_id> --url <target> --method GET|POST [--body <file.json>]
+```
+
+## Flags
+
+| Flag | Required | Value | Description |
+| --- | --- | --- | --- |
+| `--api` | Yes | `https` URL | Selo's API origin, for example `https://api.useselo.xyz`. `http` is accepted only for `localhost`, `127.0.0.1` and `[::1]`. |
+| `--authorization` | Yes | `auth_…` | A `VERIFIED` authorization that covers the target's origin, route and method. See [selo auth](/cli/auth). |
+| `--url` | Yes | `https` URL | Your paid x402 endpoint. |
+| `--method` | Yes | `GET` or `POST` | The method to test. Case-insensitive. |
+| `--body` | No | path to a JSON file | The request body for a `POST` target. Selo stores it with the preflight and sends it on every request it makes to your endpoint for this preflight and the release test that uses it. |
+
+### Body file rules
+
+- The file must hold valid JSON other than `null`, and be at most 64 KiB. Otherwise the CLI exits `3` before any request, for example `the request body file order.json must hold a JSON value other than null`.
+- Selo accepts a body only with `POST`, and only up to 16 KiB once serialized. Otherwise Selo answers `400 VALIDATION_FAILED` and the CLI exits `3`.
+- A relative path resolves against the directory you ran the command in.
+
+## What Selo checks
+
+The CLI sends `POST /v1/preflight` with `authorizationId`, `targetUrl`, `method` and, when you pass `--body`, `requestBody`. Selo then:
+
+1. checks that the target is an `https` URL on a public hostname on the default port;
+2. checks that a verified, unexpired authorization covers the target's origin, route and method;
+3. sends one unpaid request to your endpoint and reads its x402 challenge;
+4. checks that the challenge offers an `exact` payment in USDC on the Algorand network Selo pays on;
+5. checks that your price fits the per-job limit on what Selo may spend on the target (0.50 USDC on the public API);
+6. when the target is eligible, looks it up in the Bazaar catalog for the later [discovery check](/concepts/checks).
+
+See [Run a preflight](/guides/preflight) for the guide and [Pricing and limits](/resources/pricing-and-limits) for every limit.
+
+## Output
+
+### Eligible
+
+The CLI prints five lines on stdout and exits `0`:
+
+```text Terminal
+$ pnpm selo preflight --api https://api.useselo.xyz --authorization auth_… \
+    --url https://staging.example.com/v1/orders --method POST --body order.json
+preflight  pfl_…: eligible until <expiry>
+target     POST https://staging.example.com/v1/orders
+target fee <your price> USDC, paid by Selo
+Selo cap   <your price> USDC at most spent on the target
+you pay    1.00 USDC to Selo for the release test
+```
+
+| Line | Field in Selo's answer | Meaning |
+| --- | --- | --- |
+| `preflight` | `preflightId`, `expiresAt` | The preflight id and when it expires. A preflight is valid for 15 minutes. |
+| `target` | `target.method`, `target.url` | The method and URL Selo will test. |
+| `target fee` | `target.priceUsdc` | Your endpoint's price, read from its 402. Selo pays it from its own wallet. |
+| `Selo cap` | `estimatedMaxSpendUsdc` | The most Selo expects to spend on your endpoint in this test. Today it equals your price. |
+| `you pay` | `seloPriceUsdc` | Selo's price for the release test: 1.00 USDC on the public API. |
+
+<Note>
+`selo preflight` does not print Selo's payee. The payee appears in the 402 that Selo returns for `POST /v1/release-test`, and `selo test` prints it before signing. See [Finding the payTo address](/cli/test#finding-the-payto-address).
+</Note>
+
+### Not eligible
+
+Selo answers with a reason code and a message. The CLI prints them on stderr and exits `3`:
+
+```text Terminal
+ineligible (AUTHORIZATION_MISSING): No verified authorization covers this target origin, route and method
+```
+
+| Reason | HTTP | Message |
+| --- | --- | --- |
+| `AUTHORIZATION_MISSING` | `403` | No verified authorization covers this target origin, route and method |
+| `AUTHORIZATION_EXPIRED` | `403` | The authorization is not verified or has expired; verify it again |
+| `TARGET_URL_INVALID` | `400` | The target URL is not a valid absolute URL |
+| `TARGET_NOT_HTTPS` | `400` | Only https targets can be tested |
+| `TARGET_ADDRESS_BLOCKED` | `422` | The target must be a public hostname on the default https port |
+| `METHOD_NOT_ALLOWED` | `422` | The method is not allowed for this target |
+| `TARGET_UNREACHABLE` | `422` | The target could not be reached or answered with a server error |
+| `NO_PAYMENT_CHALLENGE` | `422` | The target did not answer the unpaid request with a valid x402 challenge |
+| `NETWORK_NOT_SUPPORTED` | `422` | The target offers no exact payment on the Algorand network Selo pays on |
+| `ASSET_NOT_SUPPORTED` | `422` | The target offers no exact payment in USDC on the Algorand network |
+| `PRICE_OVER_BUDGET` | `422` | The target price exceeds the per-job downstream spend limit |
+
+See [Errors and reason codes](/api-reference/errors) for the full API error catalogue.
+
+### Refused or unavailable
+
+| Situation | stderr | Exit |
+| --- | --- | --- |
+| Selo rejects the request with a `4xx` that is not an ineligible preflight, for example `400 VALIDATION_FAILED` | `HTTP 400 VALIDATION_FAILED: <Selo's message>` | `3` |
+| Selo cannot be reached | `POST https://api.useselo.xyz/v1/preflight failed: <cause>` | `2` |
+| Selo answers with a `5xx`, or with a shape the CLI does not recognize | `HTTP <status> <error>: <message>` | `2` |
+
+## Exit codes
+
+| Exit | When | GitHub Action `gate` output |
+| --- | --- | --- |
+| `0` | The preflight is eligible. | `ELIGIBLE` |
+| `2` | Selo could not be reached, answered with a `5xx`, or answered with an unexpected shape. Nothing was decided. | `BLOCK` |
+| `3` | The preflight is ineligible, a flag or the body file is invalid, or Selo refused the request with a `4xx`. | `BLOCK` |
+
+## Using the preflight id
+
+`selo test` runs its own fresh preflight on every run, so you never pass a preflight id to it. Use `selo preflight` to check terms and eligibility before you pay, for example in a free CI job on every build.
+
+The preflight id matters when you pay Selo with another x402 client: `POST /v1/release-test` takes it as `preflightId`, and it must still be valid. See [Pay with any x402 client](/guides/any-x402-client).
+
+## Examples
+
+<CodeGroup>
+
+```bash POST endpoint
+pnpm selo preflight --api https://api.useselo.xyz --authorization auth_… \
+  --url https://staging.example.com/v1/orders --method POST --body order.json
+```
+
+```bash GET endpoint
+pnpm selo preflight --api https://api.useselo.xyz --authorization auth_… \
+  --url https://staging.example.com/v1/quote --method GET
+```
+
+```yaml GitHub Actions (free, no wallet)
+- name: Free Selo preflight against staging
+  uses: Enoch208/selo/.github/actions/release-gate@<reviewed commit sha>
+  with:
+    mode: preflight
+    api: https://api.useselo.xyz
+    authorization: ${{ vars.SELO_AUTHORIZATION_ID }}
+    url: https://staging.example.com/v1/orders
+    method: POST
+    body: selo/order.json
+```
+
+</CodeGroup>
+
+## Related
+
+- [selo test](/cli/test) runs the paid release test.
+- [GitHub Action reference](/cli/github-action) for the `preflight` mode.
+- [Payments and spend limits](/concepts/payments) explains who pays what.

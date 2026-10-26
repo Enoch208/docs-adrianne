@@ -1,0 +1,167 @@
+---
+title: "selo verify"
+description: "Verify a signed Selo attestation offline against keys you trust, for an exact release, URL and method."
+icon: "file-signature"
+---
+
+`selo verify` checks a signed release attestation against keys you trust, and checks that it attests the release, URL and method you expect. It needs no wallet, pays nothing and, with a key file, uses no network. It exits with the attested verdict, so a promotion step can trust a PASS that Selo signed for this exact build.
+
+```text
+selo verify --attestation <file.json> --keys <https url|file.json> --release <id> --url <target> --method GET|POST
+```
+
+## Flags
+
+| Flag | Required | Value | Description |
+| --- | --- | --- | --- |
+| `--attestation` | Yes | file path | The attestation saved by `selo test --attestation`. |
+| `--keys` | Yes | `https` URL or file path | The trusted key set. An `http://` URL is refused with exit `3`. |
+| `--release` | Yes | 1 to 128 characters of `A-Z a-z 0-9 . _ -` | The release you expect the attestation to name, for example the commit you are about to promote. |
+| `--url` | Yes | `https` URL | The tested endpoint you expect. |
+| `--method` | Yes | `GET` or `POST` | The tested method you expect. Case-insensitive. |
+
+Relative paths resolve against the directory you ran the command in.
+
+## Trusted keys
+
+Selo publishes its attestation keys at `https://api.useselo.xyz/.well-known/selo-attestation-keys.json`:
+
+```json selo-attestation-keys.json
+{
+  "keys": [
+    {
+      "keyId": "selo-ed25519-728fcf85650b128f",
+      "algorithm": "Ed25519",
+      "publicKey": "IiUpeUTzfsbOg5-hV6i3eLnqU4uJ7hog31HmgXoc0ZQ"
+    }
+  ]
+}
+```
+
+`publicKey` is the raw Ed25519 public key, base64url-encoded. A key set is any JSON object with a `keys` array of `{ keyId, algorithm: "Ed25519", publicKey }` entries.
+
+<Tip>
+Pin the keys. Download the key set once, review it and commit it, for example as `selo/attestation-keys.json`, then pass that file to `--keys`. Never take the key location from the attestation itself. The Selo repository keeps its own pinned copy at `docs/evidence/selo-attestation-keys.json`.
+</Tip>
+
+With an `https` URL, the CLI downloads the key set on every run, with a 300-second timeout and no redirects followed. A file is read from disk and needs no network.
+
+## What it checks
+
+The checks run in this order. The first one that fails stops verification with exit `2`, and the CLI prints `not verified: <reason>` on stderr.
+
+| # | Check | Reason printed when it fails |
+| --- | --- | --- |
+| 1 | The key set can be read: the URL answers `200` with a key set, or the file holds one. | `could not read the keys at <url>`, `<url> is not a Selo key set` or `<path> is not a readable Selo key set` |
+| 2 | The attestation file holds a `{ payload, signature }` envelope with the fields below. | `the file is not a Selo release attestation` |
+| 3 | `signature.keyId` is one of your trusted keys. | `it is signed by <keyId>, which is not among the trusted keys` |
+| 4 | `signature.value` is a valid Ed25519 signature by that key over the payload's canonical JSON. | `the signature does not verify; the attestation was altered or forged` |
+| 5 | `payload.schemaVersion` is `selo.release.v1`. | `unsupported schema <version>` |
+| 6 | `payload.deployment.id` equals `--release`. | `it attests release <id>, not <release>` (`(none)` when the attestation names no release) |
+| 7 | `payload.testedTarget.url` equals `--url` and `payload.testedTarget.method` equals `--method`. | `it attests <method> <url>, not <method> <url>` |
+
+**Canonical JSON** means the payload with object keys sorted at every level and no whitespace, so the signature never covers itself. The CLI verifies the payload exactly as it appears in the file: changing any field, including the verdict, breaks the signature.
+
+**URL matching is exact** after normalization. `--url https://api.example.com` becomes `https://api.example.com/`, and a trailing slash or a different path does not match. Pass the same URL you tested.
+
+The `issuer` field is printed but not used for trust. Trust comes only from the key you pinned.
+
+## Output
+
+Verified attestations print seven lines on stdout. These are the real outputs for the two Mainnet runs against the demo merchant, using the pinned key file from the Selo repository:
+
+<CodeGroup>
+
+```text fixed-v2 (exit 0)
+$ pnpm selo verify --attestation docs/evidence/g5-release-gate-fixed-v2-attestation.json \
+    --keys docs/evidence/selo-attestation-keys.json \
+    --release fixed-v2 --url https://demo.useselo.xyz/v1/orders --method POST
+verified    signature by selo-ed25519-728fcf85650b128f (issuer https://api.useselo.xyz)
+release     fixed-v2 (asserted by the caller when tested)
+target      POST https://demo.useselo.xyz/v1/orders
+job         job_51AZ2WJZ78RF1WZC316Q1K38GG
+verdict     PASS
+inbound     EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA
+downstream  QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ
+```
+
+```text broken-v1 (exit 1)
+$ pnpm selo verify --attestation docs/evidence/g5-release-gate-broken-v1-attestation.json \
+    --keys https://api.useselo.xyz/.well-known/selo-attestation-keys.json \
+    --release broken-v1 --url https://demo.useselo.xyz/v1/orders --method POST
+verified    signature by selo-ed25519-728fcf85650b128f (issuer https://api.useselo.xyz)
+release     broken-v1 (asserted by the caller when tested)
+target      POST https://demo.useselo.xyz/v1/orders
+job         job_189NZ481HFH77CRGF60AEF22RG
+verdict     FAIL
+inbound     SVGTX3U6XQLSGJP7L7X7KNPSDLWFBSA3JK7AFNHPWENIWP4YVIEQ
+downstream  RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ
+```
+
+```text fixed-v2 presented as broken-v1 (exit 2)
+$ pnpm selo verify --attestation docs/evidence/g5-release-gate-fixed-v2-attestation.json \
+    --keys docs/evidence/selo-attestation-keys.json \
+    --release broken-v1 --url https://demo.useselo.xyz/v1/orders --method POST
+not verified: it attests release fixed-v2, not broken-v1
+```
+
+```text Tampered verdict (exit 2)
+not verified: the signature does not verify; the attestation was altered or forged
+```
+
+</CodeGroup>
+
+| Line | Content |
+| --- | --- |
+| `verified` | The key id that signed it, and the issuer named in the payload. |
+| `release` | The release you passed, which the attestation names. Selo recorded it as asserted by the caller and did not verify it. |
+| `target` | The method and URL you passed, which the attestation names. |
+| `job` | Selo's job id. |
+| `verdict` | `PASS`, `FAIL` or `INCONCLUSIVE`. |
+| `inbound` | The transaction in which Selo was paid, or `none`. |
+| `downstream` | The transactions in which Selo paid the endpoint, comma-separated, or `none`. |
+
+## Exit codes
+
+| Exit | When |
+| --- | --- |
+| `0` | Verified, and the attested verdict is `PASS`. |
+| `1` | Verified, and the attested verdict is `FAIL`. |
+| `2` | Verified, and the attested verdict is `INCONCLUSIVE`. Or the attestation could not be verified: unreadable keys, not an attestation, an untrusted key, a bad signature, an unsupported schema, or another release, URL or method. |
+| `3` | A flag is missing or invalid, or `--keys` is an `http://` URL. |
+
+<Note>
+`selo verify` trusts the signed verdict. It does not recompute the verdict from the checks the way `selo test` does, and it does not look the transactions up on chain. Use an Algorand explorer, for example `https://allo.info/tx/<txId>`, to check the payment legs independently.
+</Note>
+
+## Examples
+
+<CodeGroup>
+
+```bash Promote only a signed PASS for this commit
+pnpm selo verify --attestation selo-attestation.json --keys selo/attestation-keys.json \
+  --release "$(git rev-parse HEAD)" --url https://staging.example.com/v1/orders --method POST \
+  && ./scripts/deploy.sh production
+```
+
+```yaml GitHub Actions
+- name: Verify Selo signed a PASS for this exact commit and target
+  uses: Enoch208/selo/.github/actions/release-gate@<reviewed commit sha>
+  with:
+    mode: verify
+    attestation: selo-attestation.json
+    keys: selo/attestation-keys.json
+    release: ${{ github.sha }}
+    url: https://staging.example.com/v1/orders
+    method: POST
+```
+
+</CodeGroup>
+
+The Selo repository's `Release gate demo` workflow uses this mode to verify the two committed Mainnet attestations against the pinned key. On 26 October 2026 it [blocked broken-v1](https://github.com/Enoch208/selo/actions/runs/40308497965) and [promoted fixed-v2](https://github.com/Enoch208/selo/actions/runs/40308508699).
+
+## Related
+
+- [Verify a signed verdict](/guides/verify-attestation) is the step-by-step guide.
+- [Signed attestations](/concepts/attestations) explains what is signed and why.
+- [The attestation file](/cli/files#the-attestation-file) lists every field.

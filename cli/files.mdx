@@ -1,0 +1,650 @@
+---
+title: "Output files"
+description: "Every file the selo CLI writes: the run state, the selo.gate.v1 summary, the signed attestation and the GitHub job summary."
+icon: "folder-open"
+---
+
+`selo test` writes up to four outputs. Three are safe to publish. The run state file is not, because it holds the private report link.
+
+| Output | Written when | Holds | Safe to publish |
+| --- | --- | --- | --- |
+| [`.selo/runs/<release>.json`](#the-run-state-file) | Before the paid route is contacted, and again after every attempt | Recovery state, including the private report link | No |
+| [`--summary <file>`](#the-gate-summary) | After every attempt that reaches the payment stage, when `--summary` is set | The `selo.gate.v1` summary, with the report link redacted | Yes |
+| [`--attestation <file>`](#the-attestation-file) | When Selo returns a signed attestation and `--attestation` is set | Selo's Ed25519-signed attestation | Yes |
+| [`GITHUB_STEP_SUMMARY`](#github-step-summary) | After every attempt that reaches the payment stage, when the variable is set | The summary as Markdown, appended | Yes |
+
+A run that stops at input validation, at the run state check or at the preflight writes none of them. Relative paths resolve against the directory you ran the command in.
+
+## The run state file
+
+`selo test` records each paid attempt in `.selo/runs/<release>.json`, where `<release>` is the `--release` value. The CLI uses it to refuse a second payment while an earlier outcome is unconfirmed, and to resume that attempt with `--resume`.
+
+- **Location:** `.selo/runs/` under the directory you ran the command in. The directory is created with mode `700`.
+- **Permissions:** the file is written with mode `600`, atomically, through a `.tmp` file that is renamed into place.
+- **One file per release:** a new run for the same release replaces the file.
+- **Format:** pretty-printed JSON. Any extra or missing field makes the file unreadable to the CLI.
+
+<Warning>
+Never upload `.selo/` as a CI artifact or commit it. The `reportUrl` field holds the full private report link.
+</Warning>
+
+### Fields
+
+<ResponseField name="schema" type="string" required>
+  Always `selo.cli.run.v1`.
+</ResponseField>
+<ResponseField name="release" type="string" required>
+  The `--release` value. Also the file name.
+</ResponseField>
+<ResponseField name="api" type="string" required>
+  The `--api` origin, for example `https://api.useselo.xyz`.
+</ResponseField>
+<ResponseField name="target" type="object" required>
+  The endpoint under test.
+  <Expandable title="properties">
+    <ResponseField name="url" type="string" required>
+      The normalized `--url`.
+    </ResponseField>
+    <ResponseField name="method" type="string" required>
+      `GET` or `POST`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="network" type="string" required>
+  `algorand-mainnet` or `algorand-testnet`.
+</ResponseField>
+<ResponseField name="payer" type="string" required>
+  The payer wallet's Algorand address. Never the mnemonic.
+</ResponseField>
+<ResponseField name="preflightId" type="string" required>
+  The preflight the attempt pays for. `--resume` reuses it.
+</ResponseField>
+<ResponseField name="idempotencyKey" type="string" required>
+  `selo-cli-` followed by the first 48 hex characters of the SHA-256 of `<preflightId>:<payer>`. `--resume` sends it again so Selo never settles a duplicate.
+</ResponseField>
+<ResponseField name="phase" type="string" required>
+  `paying`, `unresolved`, `rejected` or `concluded`. See [Phases](#phases).
+</ResponseField>
+<ResponseField name="message" type="string" required>
+  Why the run is in this phase: `the paid request is being sent` while paying, otherwise the same reason the gate line and the summary show.
+</ResponseField>
+<ResponseField name="expectedInboundTxId" type="string | null" required>
+  The transaction id of your payment to Selo, computed from the signed payment before it was sent. Look it up on an Algorand explorer when an outcome is unconfirmed. `null` when nothing was signed. A resumed run keeps the id recorded first.
+</ResponseField>
+<ResponseField name="jobId" type="string | null" required>
+  Selo's job id, when a report came back.
+</ResponseField>
+<ResponseField name="verdict" type="string | null" required>
+  `PASS`, `FAIL` or `INCONCLUSIVE` as reported, when a report came back.
+</ResponseField>
+<ResponseField name="reportUrl" type="string | null" required>
+  The full, private report link, when a report came back. This is the only place the CLI keeps it.
+</ResponseField>
+<ResponseField name="updatedAt" type="string" required>
+  When the file was last written, as an ISO 8601 timestamp.
+</ResponseField>
+
+```json .selo/runs/<release>.json
+{
+  "schema": "selo.cli.run.v1",
+  "release": "<your release id>",
+  "api": "https://api.useselo.xyz",
+  "target": {
+    "url": "https://staging.example.com/v1/orders",
+    "method": "POST"
+  },
+  "network": "algorand-mainnet",
+  "payer": "<payer address>",
+  "preflightId": "pfl_…",
+  "idempotencyKey": "selo-cli-<48 hex characters>",
+  "phase": "concluded",
+  "message": "PASS on every release check",
+  "expectedInboundTxId": "<transaction id>",
+  "jobId": "job_…",
+  "verdict": "PASS",
+  "reportUrl": "https://api.useselo.xyz/v1/reports/<private token>",
+  "updatedAt": "<ISO 8601 timestamp>"
+}
+```
+
+### Phases
+
+| Phase | Meaning | Blocks a new paid run | `--resume` |
+| --- | --- | --- | --- |
+| `paying` | Written just before the CLI contacts the paid route. If the CLI stops before it records an outcome, the file keeps this phase. | Yes | Allowed |
+| `unresolved` | The payment was sent and its outcome is not confirmed: no answer, a redirect, a `5xx`, a held settlement, a job still in progress, or any refusal while resuming. | Yes | Allowed |
+| `rejected` | Nothing was charged: the CLI refused before signing, Selo could not be reached before payment, or Selo refused the paid request (`402`, `FACILITATOR_UNAVAILABLE`, another `4xx`). | No | Refused: `the last run for release <release> is already rejected: …` |
+| `concluded` | Selo answered with a report, with an answer that is not a report, or with `JOB_TERMINAL`. | No | Refused: `the last run for release <release> is already concluded: …` |
+
+While the phase is `paying` or `unresolved`, every `selo test` for that release prints recovery instructions and exits `2` without contacting Selo. See [Resuming an unconfirmed run](/cli/test#resuming-an-unconfirmed-run) and [Recover an interrupted run](/guides/resume).
+
+<Warning>
+The CLI never clears a `paying` or `unresolved` run on its own. Removing or editing the file removes that protection: the next run starts a new preflight and pays again. Do it only after you have checked on chain whether the earlier payment settled.
+</Warning>
+
+If the file exists but cannot be read or does not match the shape above, every run for that release exits `2` with `the run state <path> is unreadable; inspect it before paying again`.
+
+## The gate summary
+
+`--summary <file>` writes a `selo.gate.v1` JSON summary: the gate decision, the verdict, every check, both payment legs and the job id. The report link is redacted, so the file is safe to upload as a CI artifact. Parent directories are created, and an existing file is overwritten.
+
+### Example
+
+These are the summaries of the two Mainnet runs against the demo merchant on 26 October 2026, as committed in the Selo repository's `docs/evidence/`.
+
+<Tabs>
+  <Tab title="fixed-v2 (ALLOW)">
+
+```json g5-release-gate-fixed-v2.json
+{
+  "schema": "selo.gate.v1",
+  "release": {
+    "id": "fixed-v2",
+    "verification": "asserted_by_client"
+  },
+  "target": {
+    "url": "https://demo.useselo.xyz/v1/orders",
+    "method": "POST"
+  },
+  "network": "algorand-mainnet",
+  "gate": "ALLOW",
+  "exitCode": 0,
+  "reason": "PASS on every release check",
+  "verdict": "PASS",
+  "inconclusiveReason": null,
+  "checks": [
+    {
+      "id": "handshake",
+      "status": "PASS",
+      "code": "HANDSHAKE_VALID",
+      "summary": "Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704."
+    },
+    {
+      "id": "paid_delivery",
+      "status": "PASS",
+      "code": "PAID_AND_DELIVERED",
+      "summary": "Downstream payment settled and target returned 200 with transaction QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ."
+    },
+    {
+      "id": "response_contract",
+      "status": "PASS",
+      "code": "CONTRACT_MATCHED",
+      "summary": "Observed response matched the expected status 200 and content type application/json."
+    },
+    {
+      "id": "discovery_contract",
+      "status": "PASS",
+      "code": "DISCOVERY_CONSISTENT",
+      "summary": "Live challenge and catalog record agree on method, URL, payment terms and carry usable metadata."
+    },
+    {
+      "id": "retry_safety",
+      "status": "PASS",
+      "code": "PASS_REPLAY_REJECTED",
+      "summary": "Replaying the identical signed payment header was rejected with status 402."
+    }
+  ],
+  "warnings": [],
+  "money": {
+    "seloInboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+    "downstreamTxIds": ["QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"],
+    "downstreamSpendUsdc": "0.01"
+  },
+  "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+  "report": "https://api.useselo.xyz/v1/reports/<private>",
+  "decidedAt": "2026-10-26T10:24:14.275Z"
+}
+```
+
+  </Tab>
+  <Tab title="broken-v1 (BLOCK)">
+
+```json g5-release-gate-broken-v1.json
+{
+  "schema": "selo.gate.v1",
+  "release": {
+    "id": "broken-v1",
+    "verification": "asserted_by_client"
+  },
+  "target": {
+    "url": "https://demo.useselo.xyz/v1/orders",
+    "method": "POST"
+  },
+  "network": "algorand-mainnet",
+  "gate": "BLOCK",
+  "exitCode": 1,
+  "reason": "FAIL: response_contract",
+  "verdict": "FAIL",
+  "inconclusiveReason": null,
+  "checks": [
+    {
+      "id": "handshake",
+      "status": "PASS",
+      "code": "HANDSHAKE_VALID",
+      "summary": "Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704."
+    },
+    {
+      "id": "paid_delivery",
+      "status": "PASS",
+      "code": "PAID_AND_DELIVERED",
+      "summary": "Downstream payment settled and target returned 200 with transaction RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ."
+    },
+    {
+      "id": "response_contract",
+      "status": "FAIL",
+      "code": "SCHEMA_MISMATCH",
+      "summary": "Response body did not match the expected schema: must have required property 'receiptId'"
+    },
+    {
+      "id": "discovery_contract",
+      "status": "INCONCLUSIVE",
+      "code": "CATALOG_UNAVAILABLE",
+      "summary": "The Bazaar catalog could not be reached to cross-check this resource."
+    },
+    {
+      "id": "retry_safety",
+      "status": "PASS",
+      "code": "PASS_REPLAY_REJECTED",
+      "summary": "Replaying the identical signed payment header was rejected with status 402."
+    }
+  ],
+  "warnings": [],
+  "money": {
+    "seloInboundTxId": "SVGTX3U6XQLSGJP7L7X7KNPSDLWFBSA3JK7AFNHPWENIWP4YVIEQ",
+    "downstreamTxIds": ["RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ"],
+    "downstreamSpendUsdc": "0.01"
+  },
+  "jobId": "job_189NZ481HFH77CRGF60AEF22RG",
+  "report": "https://api.useselo.xyz/v1/reports/<private>",
+  "decidedAt": "2026-10-26T09:43:11.344Z"
+}
+```
+
+  </Tab>
+  <Tab title="No report (shape)">
+
+When no report came back, for example because Selo answered the paid request with `402`, the report fields are empty:
+
+```json selo-gate.json
+{
+  "schema": "selo.gate.v1",
+  "release": {
+    "id": "<your release id>",
+    "verification": "asserted_by_client"
+  },
+  "target": {
+    "url": "https://staging.example.com/v1/orders",
+    "method": "POST"
+  },
+  "network": "algorand-mainnet",
+  "gate": "BLOCK",
+  "exitCode": 3,
+  "reason": "Selo did not accept the payment, nothing was charged: HTTP 402 …",
+  "verdict": null,
+  "inconclusiveReason": null,
+  "checks": [],
+  "warnings": [],
+  "money": {
+    "seloInboundTxId": null,
+    "downstreamTxIds": [],
+    "downstreamSpendUsdc": null
+  },
+  "jobId": null,
+  "report": null,
+  "decidedAt": "<ISO 8601 timestamp>"
+}
+```
+
+  </Tab>
+</Tabs>
+
+In the broken-v1 run, `discovery_contract` was INCONCLUSIVE because the Bazaar catalog could not be read at the time. The proven `response_contract` FAIL decides the verdict regardless.
+
+### Fields
+
+<ResponseField name="schema" type="string" required>
+  Always `selo.gate.v1`.
+</ResponseField>
+<ResponseField name="release" type="object" required>
+  The release you named.
+  <Expandable title="properties">
+    <ResponseField name="id" type="string" required>
+      The `--release` value.
+    </ResponseField>
+    <ResponseField name="verification" type="string" required>
+      Always `asserted_by_client`: Selo did not verify which build is deployed.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="target" type="object" required>
+  <Expandable title="properties">
+    <ResponseField name="url" type="string" required>
+      The normalized `--url`.
+    </ResponseField>
+    <ResponseField name="method" type="string" required>
+      `GET` or `POST`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="network" type="string" required>
+  `algorand-mainnet` or `algorand-testnet`, from `--network`.
+</ResponseField>
+<ResponseField name="gate" type="string" required>
+  `ALLOW` only for a fully evidenced PASS, otherwise `BLOCK`.
+</ResponseField>
+<ResponseField name="exitCode" type="number" required>
+  The exit code of the run: `0`, `1`, `2` or `3`.
+</ResponseField>
+<ResponseField name="reason" type="string" required>
+  The gate's reason, the same text as the `gate` line in the terminal. For example `PASS on every release check`, `FAIL: response_contract`, `INCONCLUSIVE: EVIDENCE_INCOMPLETE`, or a refusal message. See [Exit paths](/cli/test#exit-paths).
+</ResponseField>
+<ResponseField name="verdict" type="string | null" required>
+  `PASS`, `FAIL` or `INCONCLUSIVE` as reported by Selo, or `null` when no report came back.
+</ResponseField>
+<ResponseField name="inconclusiveReason" type="string | null" required>
+  Why the verdict is INCONCLUSIVE: `NETWORK_UNAVAILABLE`, `FACILITATOR_UNAVAILABLE`, `TARGET_TIMEOUT`, `BUDGET_EXHAUSTED`, `PAYMENT_UNRESOLVED`, `EVIDENCE_INCOMPLETE`, `AUTHORIZATION_LAPSED` or `INTERNAL_ERROR`. Otherwise `null`.
+</ResponseField>
+<ResponseField name="checks" type="object[]" required>
+  One entry per release check in the report, empty when no report came back. Evidence ids are not included; they are in the [attestation](#the-attestation-file).
+  <Expandable title="properties">
+    <ResponseField name="id" type="string" required>
+      `handshake`, `paid_delivery`, `response_contract`, `discovery_contract` or `retry_safety`.
+    </ResponseField>
+    <ResponseField name="status" type="string" required>
+      `PASS`, `WARN`, `FAIL` or `INCONCLUSIVE`.
+    </ResponseField>
+    <ResponseField name="code" type="string" required>
+      The check's result code, for example `SCHEMA_MISMATCH`.
+    </ResponseField>
+    <ResponseField name="summary" type="string" required>
+      Selo's one-line explanation.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="warnings" type="string[]" required>
+  Warnings from the report, empty when there are none or no report came back.
+</ResponseField>
+<ResponseField name="money" type="object" required>
+  Both payment legs.
+  <Expandable title="properties">
+    <ResponseField name="seloInboundTxId" type="string | null" required>
+      The transaction in which you paid Selo, or `null` when no report came back.
+    </ResponseField>
+    <ResponseField name="downstreamTxIds" type="string[]" required>
+      The transactions in which Selo paid your endpoint.
+    </ResponseField>
+    <ResponseField name="downstreamSpendUsdc" type="string | null" required>
+      What Selo spent on your endpoint, as a decimal USDC string, or `null`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="jobId" type="string | null" required>
+  Selo's job id, or `null` when no report came back.
+</ResponseField>
+<ResponseField name="report" type="string | null" required>
+  The report link with its private token replaced by `<private>`, or `null` when no report came back. A link that cannot be parsed becomes `<private report link>`.
+</ResponseField>
+<ResponseField name="decidedAt" type="string" required>
+  When the CLI decided the gate, as an ISO 8601 timestamp.
+</ResponseField>
+
+## The attestation file
+
+`--attestation <file>` saves the signed attestation that Selo returns with the report, exactly as received, as pretty-printed JSON. It holds no secret and is safe to publish. [`selo verify`](/cli/verify) checks it offline. When Selo returns no attestation, the CLI prints `attestation none: Selo issued no signed attestation for this run` and writes nothing.
+
+The file is an envelope `{ payload, signature }`. The signature is Ed25519 over the canonical JSON of `payload`: object keys sorted at every level, no whitespace. See [Signed attestations](/concepts/attestations).
+
+### Fields
+
+<ResponseField name="payload" type="object" required>
+  The signed statement.
+  <Expandable title="properties">
+    <ResponseField name="schemaVersion" type="string" required>
+      `selo.release.v1`.
+    </ResponseField>
+    <ResponseField name="issuer" type="string" required>
+      The Selo deployment that signed it, for example `https://api.useselo.xyz`.
+    </ResponseField>
+    <ResponseField name="jobId" type="string" required>
+      Selo's job id.
+    </ResponseField>
+    <ResponseField name="testedTarget" type="object" required>
+      `url` and `method` of the endpoint Selo tested.
+    </ResponseField>
+    <ResponseField name="deployment" type="object | null" required>
+      `id` (the release you asserted) and `verification` (always `asserted_by_client`), or `null` when no release was sent.
+    </ResponseField>
+    <ResponseField name="testedAt" type="string | null" required>
+      When the job started.
+    </ResponseField>
+    <ResponseField name="completedAt" type="string" required>
+      When the job completed.
+    </ResponseField>
+    <ResponseField name="seloVersion" type="string" required>
+      The commit of Selo that ran the test, or `unknown`.
+    </ResponseField>
+    <ResponseField name="verdict" type="string" required>
+      `PASS`, `FAIL` or `INCONCLUSIVE`.
+    </ResponseField>
+    <ResponseField name="inconclusiveReason" type="string | null" required>
+      Why the verdict is INCONCLUSIVE, otherwise `null`.
+    </ResponseField>
+    <ResponseField name="checks" type="object[]" required>
+      Each check's `id`, `status`, `code`, `blocking` flag and `evidence` ids.
+    </ResponseField>
+    <ResponseField name="expectedContractSha256" type="string | null" required>
+      SHA-256 of the canonical JSON of your release contract, or `null` when none was sent.
+    </ResponseField>
+    <ResponseField name="targetChallengeSha256" type="string | null" required>
+      The SHA-256 of your endpoint's 402, as recorded in the `target_challenge` evidence row, or `null`.
+    </ResponseField>
+    <ResponseField name="payments" type="object" required>
+      `network` (CAIP-2), `asset` (the USDC ASA id), `inboundTxId`, `inboundAmountUsdc`, and `downstream`: one entry per payment Selo made to your endpoint, with `status`, `amountUsdc` and `txId`.
+    </ResponseField>
+    <ResponseField name="evidenceSha256" type="string" required>
+      SHA-256 of the canonical JSON of the `evidence` manifest.
+    </ResponseField>
+    <ResponseField name="evidence" type="object[]" required>
+      The evidence manifest, sorted by id: each row's `id`, `kind` (for example `target_challenge`, `paid_response`, `replay_response`, `downstream_payment`) and `sha256`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="signature" type="object" required>
+  <Expandable title="properties">
+    <ResponseField name="algorithm" type="string" required>
+      `Ed25519`.
+    </ResponseField>
+    <ResponseField name="keyId" type="string" required>
+      The signing key, for example `selo-ed25519-728fcf85650b128f`. Match it against your pinned key set.
+    </ResponseField>
+    <ResponseField name="value" type="string" required>
+      The signature, base64url-encoded.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<Accordion title="Full example: the fixed-v2 attestation">
+
+```json g5-release-gate-fixed-v2-attestation.json
+{
+  "payload": {
+    "schemaVersion": "selo.release.v1",
+    "issuer": "https://api.useselo.xyz",
+    "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+    "testedTarget": {
+      "url": "https://demo.useselo.xyz/v1/orders",
+      "method": "POST"
+    },
+    "deployment": {
+      "id": "fixed-v2",
+      "verification": "asserted_by_client"
+    },
+    "testedAt": "2026-10-26T10:24:02.883Z",
+    "completedAt": "2026-10-26T10:24:12.218Z",
+    "seloVersion": "71080ad",
+    "verdict": "PASS",
+    "inconclusiveReason": null,
+    "checks": [
+      {
+        "id": "handshake",
+        "status": "PASS",
+        "code": "HANDSHAKE_VALID",
+        "blocking": true,
+        "evidence": ["evd_B23GQN052SFAET2QME89MVYX5G"]
+      },
+      {
+        "id": "paid_delivery",
+        "status": "PASS",
+        "code": "PAID_AND_DELIVERED",
+        "blocking": true,
+        "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"]
+      },
+      {
+        "id": "response_contract",
+        "status": "PASS",
+        "code": "CONTRACT_MATCHED",
+        "blocking": true,
+        "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW"]
+      },
+      {
+        "id": "discovery_contract",
+        "status": "PASS",
+        "code": "DISCOVERY_CONSISTENT",
+        "blocking": true,
+        "evidence": ["evd_TE2XZJB33D4CXHV2EMW84SS6BG"]
+      },
+      {
+        "id": "retry_safety",
+        "status": "PASS",
+        "code": "PASS_REPLAY_REJECTED",
+        "blocking": true,
+        "evidence": ["evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R"]
+      }
+    ],
+    "expectedContractSha256": "6e5b149b1088d214be6a1c097e2e06bf1127fe529c544731023abea7b03e7170",
+    "targetChallengeSha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc",
+    "payments": {
+      "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+      "asset": "31566704",
+      "inboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+      "inboundAmountUsdc": "1.00",
+      "downstream": [
+        {
+          "status": "SETTLED",
+          "amountUsdc": "0.01",
+          "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"
+        }
+      ]
+    },
+    "evidenceSha256": "49d787f15e7001a408f495aa59f4b16214dca58838e9e99ddd4790f6d6565a96",
+    "evidence": [
+      {
+        "id": "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+        "kind": "paid_response",
+        "sha256": "7815cd18d10df182be8f325d6d7a3b67800060da3efeff5c9c01fd409794398b"
+      },
+      {
+        "id": "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R",
+        "kind": "replay_response",
+        "sha256": "a72223caf72ed2bd2d24114062b7cb15655f0d0e9c8cd4442a3bac9e791cae85"
+      },
+      {
+        "id": "evd_B23GQN052SFAET2QME89MVYX5G",
+        "kind": "target_challenge",
+        "sha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc"
+      },
+      {
+        "id": "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW",
+        "kind": "response_contract",
+        "sha256": "f3f8cef64a663df7d7c192ff542878b6653df048b227305e50457bab0fab4bd0"
+      },
+      {
+        "id": "evd_MVWEZKMTNT45MWX6RDA8G6HRQ0",
+        "kind": "authorization_snapshot",
+        "sha256": "207c2d476ea56e68e5bb88fa34ac5a943912be83251088a30f93f99c515626da"
+      },
+      {
+        "id": "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4",
+        "kind": "downstream_payment",
+        "sha256": "cca974ffefb3a23f9528745f1c205e58fc5687e8ef18a0bab527f110fedf609e"
+      },
+      {
+        "id": "evd_SXXV98XNSNVMPPPF7R7YR2RSC8",
+        "kind": "authorization_snapshot",
+        "sha256": "208afc651b36a13f9b93c2decb89cc70558559c709d67ca83606ae65bb2f54e1"
+      },
+      {
+        "id": "evd_TE2XZJB33D4CXHV2EMW84SS6BG",
+        "kind": "catalog_record",
+        "sha256": "4503636c21768df0807c0dfd88ba1813a9f2fdf9629bdf59fce723ed21e25712"
+      }
+    ]
+  },
+  "signature": {
+    "algorithm": "Ed25519",
+    "keyId": "selo-ed25519-728fcf85650b128f",
+    "value": "E3lC29kTmj4Ts8SVoEDFabdAGGAO7ZZs4n9p2P7HUWGePMfi4aO75xQ-v7cynT1T4nT6mB2iQZYAzXe2YIbeBg"
+  }
+}
+```
+
+</Accordion>
+
+## GitHub step summary
+
+When the `GITHUB_STEP_SUMMARY` environment variable is set, `selo test` appends the summary to that file as Markdown. GitHub Actions sets the variable for every step and renders the file on the run's summary page. Each run appends one block: a heading with the gate, the reason in bold, a table of the release, target, network, verdict, both payment legs and the job, then one row per check. The checks table is left out when no report came back. Pipes in values are escaped and line breaks become spaces.
+
+This is the block for the fixed-v2 run, generated from its committed summary:
+
+```markdown GITHUB_STEP_SUMMARY
+### Selo release gate: ALLOW: release may be promoted
+
+**PASS on every release check**
+
+| | |
+| --- | --- |
+| Release | `fixed-v2` (asserted by the caller) |
+| Target | `POST https://demo.useselo.xyz/v1/orders` |
+| Network | algorand-mainnet |
+| Verdict | PASS |
+| Selo was paid | EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA |
+| Selo paid the target | QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ |
+| Job | job_51AZ2WJZ78RF1WZC316Q1K38GG |
+
+| Check | Status | Code | Summary |
+| --- | --- | --- | --- |
+| handshake | PASS | HANDSHAKE_VALID | Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704. |
+| paid_delivery | PASS | PAID_AND_DELIVERED | Downstream payment settled and target returned 200 with transaction QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ. |
+| response_contract | PASS | CONTRACT_MATCHED | Observed response matched the expected status 200 and content type application/json. |
+| discovery_contract | PASS | DISCOVERY_CONSISTENT | Live challenge and catalog record agree on method, URL, payment terms and carry usable metadata. |
+| retry_safety | PASS | PASS_REPLAY_REJECTED | Replaying the identical signed payment header was rejected with status 402. |
+```
+
+A blocked run starts with `### Selo release gate: BLOCK: do not promote`. When there is no data, the rows read `none`, `no settlement recorded` or `no payment recorded`.
+
+## What is redacted
+
+| Value | Terminal | `--summary` | `GITHUB_STEP_SUMMARY` | Run state | Attestation |
+| --- | --- | --- | --- | --- | --- |
+| Payer mnemonic | Never | Never | Never | Never | Never |
+| Signed payment | Never | Never | Never | Never | Never |
+| Report link token | Redacted | Redacted | Not included | Full link | Not included |
+| Payer address | Printed | Not included | Not included | Stored | Not included |
+| Transaction ids, job id, verdict, checks | Printed | Included | Included | Job id, verdict and expected inbound transaction id | Included |
+
+## Input files
+
+For completeness, the files the CLI reads:
+
+| File | Flag | Limits | Reference |
+| --- | --- | --- | --- |
+| Release contract | `selo test --contract` | JSON object with only `status`, `contentType`, `jsonSchema`; file at most 64 KiB; schema compiled in strict mode, at most 16 KiB | [Write a release contract](/guides/release-contract) |
+| Request body | `selo preflight --body`, `selo test --body` | Any JSON value but `null`; file at most 64 KiB; at most 16 KiB once serialized; `POST` only | [selo test flags](/cli/test#flags) |
+| Attestation | `selo verify --attestation` | A `{ payload, signature }` envelope | [selo verify](/cli/verify) |
+| Key set | `selo verify --keys` | `{ "keys": [{ keyId, algorithm: "Ed25519", publicKey }] }` | [Trusted keys](/cli/verify#trusted-keys) |
+
+## Related
+
+- [selo test](/cli/test) writes these files.
+- [GitHub Action reference](/cli/github-action) uploads the summary and the attestation as an artifact.
+- [Objects](/api-reference/objects) documents the report and the attestation as the API returns them.
