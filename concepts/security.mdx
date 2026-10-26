@@ -1,0 +1,181 @@
+---
+title: "Security model"
+description: "What Selo will connect to, how it keeps secrets out of evidence and logs, who can read a report, and what it stores."
+icon: "shield-halved"
+sidebarTitle: "Security model"
+---
+
+Selo fetches URLs that other people give it, and it spends real money. Its security model answers five questions: where Selo will connect, how much it can spend, what it keeps out of its records, who can read a report, and what the CLI does with your wallet. Every rule on this page is enforced in code and covered by tests.
+
+## Authorization comes first
+
+Selo sends no request to a route unless a verified, unexpired [authorization](/concepts/authorization) covers its exact origin, path and method. The address rules below apply on top of that: even an authorized URL is refused if it points at a private network.
+
+## Target URL rules
+
+Every target URL, and every redirect hop Selo is allowed to follow, must pass these rules before any DNS lookup.
+
+| Rule | Refused as |
+| --- | --- |
+| Parses as an absolute URL | `TARGET_URL_INVALID` |
+| Uses `https` | `TARGET_NOT_HTTPS` |
+| Carries no user name or password | `TARGET_URL_INVALID` |
+| Uses the default port 443; no other port is allowed | `TARGET_ADDRESS_BLOCKED` |
+| Names a host rather than an IP address. Dotted IPv4, bracketed IPv6, and names whose last label is numeric or hexadecimal are IP literals | `TARGET_ADDRESS_BLOCKED` |
+| Has at least two labels and no empty label, so `localhost` alone is refused | `TARGET_ADDRESS_BLOCKED` |
+| Does not end in `.localhost`, `.local`, `.internal`, `.home.arpa` or `.lan` | `TARGET_ADDRESS_BLOCKED` |
+| Stays on the origin the request was created for | `ORIGIN_NOT_ALLOWED` |
+
+The fragment is dropped; the query string is kept.
+
+## Blocked address ranges
+
+After DNS resolution, every resolved address is classified. Selo connects only if **every** address in the answer is public.
+
+| IPv4 range | What it is |
+| --- | --- |
+| `0.0.0.0/8` | "This network" |
+| `10.0.0.0/8` | Private |
+| `100.64.0.0/10` | Carrier-grade NAT (CGNAT) |
+| `127.0.0.0/8` | Loopback |
+| `169.254.0.0/16` | Link-local, including the cloud metadata address `169.254.169.254` |
+| `172.16.0.0/12` | Private |
+| `192.0.0.0/24` | IETF protocol assignments |
+| `192.0.2.0/24` | Documentation (TEST-NET-1) |
+| `192.88.99.0/24` | 6to4 relay anycast |
+| `192.168.0.0/16` | Private |
+| `198.18.0.0/15` | Benchmarking |
+| `198.51.100.0/24` | Documentation (TEST-NET-2) |
+| `203.0.113.0/24` | Documentation (TEST-NET-3) |
+| `224.0.0.0/4` | Multicast |
+| `240.0.0.0/4` | Reserved, including broadcast |
+
+For IPv6:
+
+- Any address outside `2000::/3` (global unicast) is blocked. That covers `::1` loopback, `::` unspecified, `fc00::/7` unique local, `fe80::/10` link-local and `ff00::/8` multicast.
+- `2001::/32` (Teredo) and `2001:db8::/32` (documentation) are blocked.
+- IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible, NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) addresses are judged by the IPv4 address they embed.
+- Any address with a zone index (`%eth0`) is blocked.
+
+## DNS resolution and pinning
+
+Checking a hostname and then letting the HTTP client resolve it again would leave a gap: a DNS rebinding attack can answer the second lookup with a private address. Selo closes that gap:
+
+1. It resolves the hostname once and collects every address in the answer. An empty answer is a network failure.
+2. It refuses the request if any address is not public.
+3. It connects to the first vetted address through a connector pinned to that hostname and address. The connector refuses to resolve any other hostname.
+4. TLS still validates the certificate against the hostname, so pinning does not weaken HTTPS.
+5. Each redirect hop is resolved, classified and pinned again from scratch.
+
+The connection must be established within 5 seconds.
+
+## Redirects
+
+| Traffic | Redirects |
+| --- | --- |
+| Preflight probe, `handshake` request, paid request and replay | **Never followed.** A `3xx` is recorded as the observed response. A signed payment never follows a redirect |
+| Reading `/.well-known/selo-verification.txt` | Followed up to 3 times (`301`, `302`, `303`, `307`, `308`). The fourth is refused with `TOO_MANY_REDIRECTS` |
+
+When Selo follows a redirect, each hop must pass every URL rule and stay on the same origin, and Selo strips `authorization`, `cookie`, `proxy-authorization`, `payment-signature` and `x-payment` from the request. A `301`, `302` or `303` becomes a `GET` without a body.
+
+## Time and size limits
+
+| Limit | Value |
+| --- | --- |
+| JSON request body to Selo's API | 64 KiB, otherwise `413 PAYLOAD_TOO_LARGE` |
+| Preflight `requestBody` | 16 KiB, POST only |
+| Release contract `jsonSchema` | 16 KiB serialized |
+| Verification file | 4 KiB, 10-second timeout |
+| Preflight probe and `handshake` request | 10 seconds |
+| Paid request | 20 seconds; response body read up to 256 KiB |
+| Replay | 20 seconds; response body read up to 1 MiB |
+| Whole release job | 60 seconds of wall clock |
+| Opening a connection | 5 seconds |
+| Reading Selo's own wallet balance | 5 seconds |
+| Bazaar catalog lookup | 10 seconds per page, 20 seconds overall, at most 20 pages of 100 |
+
+A body that announces a `content-length` over the limit is refused before it is read; a streamed body is cut off as soon as it passes the limit.
+
+## Spend caps
+
+A job can spend at most 0.50 USDC paying your endpoint, and no configuration can raise a job's budget above 5.00 USDC. The budget is enforced by one conditional database update in the same transaction that records the payment, with CHECK constraints as a backstop, and any payment with an unclear outcome stops all further spending for the job. See [Payments and spend limits](/concepts/payments).
+
+## Secrets never reach evidence or logs
+
+Selo redacts in two layers. A secret is replaced by `sha256:` followed by the hex SHA-256 of its value, so you can still match it against a value you hold without Selo keeping it.
+
+### Layer 1: headers at capture
+
+When Selo records a response's headers, it replaces the values of `authorization`, `proxy-authorization`, `cookie`, `set-cookie` (each cookie separately), `payment-signature` and `x-payment` with their hash. The signed payment header that Selo sends is never stored; evidence keeps only its hash.
+
+### Layer 2: every stored or logged value
+
+Every value written to evidence, scenario records, the evidence packet and alerts passes through a sanitizer:
+
+- **Secret keys.** A field whose name, lowercased with `_` and `-` removed, is `authorization`, `proxyauthorization`, `cookie`, `setcookie`, `xpayment`, `paymentsignature`, `sk`, `sig`, `accesstoken`, `refreshtoken`, `idtoken`, `apikey` or `bearer`, or contains `mnemonic`, `secret`, `privatekey`, `password`, `passphrase` or `signature`, has its value hashed (strings) or replaced by `[redacted]` (anything else). An `authorization` field that holds an object, such as an authorization snapshot, is sanitized field by field instead.
+- **Secret values anywhere.** Inside any string, a base64 token of 40 or more characters that decodes to a signed Algorand transaction, or to JSON that contains a secret, is hashed.
+- **Wallet phrases.** A run of 24 or more words of which at least 90% are Algorand mnemonic words is hashed, even with a mistyped word or inside longer text.
+- **Bounds.** Strings are truncated at 4,096 characters after secrets are hashed, and nesting is cut at depth 12.
+
+<Check>
+  The test `A22: logs, evidence, reports and the evidence packet contain no wallet secret` runs a full paid release test, then searches stdout, stderr, the evidence table, the API response, the report and the evidence packet for any three consecutive words of the mnemonic of Selo's operating wallet, which signs the downstream payment, and for every signed payment header. None may appear.
+</Check>
+
+## Report links are private
+
+Each report lives at `https://api.useselo.xyz/v1/reports/<token>`:
+
+- The token is an HMAC-SHA256 of the job id under a server secret of at least 32 characters, encoded as 43 base64url characters. It cannot be guessed from the job id.
+- Selo stores only the SHA-256 of the token. A database copy does not reveal any report link.
+- The route serves only jobs whose report is written. An unknown and a malformed token get the same `404` answer.
+- Every answer carries `X-Robots-Tag: noindex, nofollow`, `Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`.
+
+Anyone who holds the link can read the report, so treat it like a password. The CLI prints the link with its token replaced by `<private>` and writes the same redacted form into gate summaries; the full link is kept only in the local run file under `.selo/runs/`.
+
+## The CLI and your wallet
+
+The `selo` CLI pays Selo from the wallet in `SELO_PAYER_MNEMONIC`. Use a dedicated payer wallet that holds only what you are willing to spend.
+
+- The mnemonic is read from the environment and never printed or written to disk; neither is the signed payment or the report token.
+- On Mainnet, the CLI refuses to pay without `--approve-mainnet` and the `--pay-to` address you expect Selo to use. It checks both before sending any request.
+- It refuses before signing if Selo's price is above `--max-usdc` or Selo's `402` names a network other than `--network`.
+- It never retries a payment on its own. If an outcome is unconfirmed, it records the attempt in `.selo/runs/<release>.json` and refuses to pay again until you [resume](/guides/resume).
+- With `GITHUB_STEP_SUMMARY` set, it appends a sanitized summary of the gate decision.
+
+See the [CLI overview](/cli/overview) for every flag.
+
+## What Selo stores
+
+| Record | Contents |
+| --- | --- |
+| Authorization | Origin, route, method, type, the SHA-256 of the verification token, the consent note for manual consent, project, contact, status, and verification and expiry times |
+| Preflight | Target URL and method; the selected payment requirement (network, asset, amount, `payTo`); your decoded challenge, limited to `x402Version`, `resource`, `accepts`, `extensions` and `error`, with its hash; the request body you supplied; the Bazaar record if one was found, with its hash; eligibility and expiry |
+| Release job | Status, verdict and reason; a hash identifying your request; the payer address, inbound transaction id, amount and settlement time; the budget counters; your release contract and release id; the Selo commit; the SHA-256 of the report token; timestamps |
+| Scenario | For each check: operation id, status, attempt count, the sanitized expected and observed results, failure code and timestamps |
+| Downstream payment | Target origin, amount, network, asset, `payTo`, claimed and expected transaction ids, last valid round, requirement hash, status, resolution reason and timestamps |
+| Evidence | Kind, SHA-256 and sanitized JSON. The paid response record keeps the first 2,048 characters of the body; the contract and replay records keep only the body's hash and size |
+| Evidence packet | One file per job on Selo's server with the sanitized records, written with owner-only permissions |
+| Logs | One JSON line per event with ids, amounts, statuses and durations; alerts pass through the sanitizer |
+
+Selo never stores your mnemonic (the CLI never sends it), the signed payment header, the report token or the verification token.
+
+<Warning>
+  The preflight `requestBody` is stored as you sent it and is sent to your endpoint on every request of the run. Use test data, not real credentials or personal data.
+</Warning>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Authorization" icon="key" href="/concepts/authorization">
+    How a route is authorized and when Selo re-checks it.
+  </Card>
+  <Card title="Payments and spend limits" icon="coins" href="/concepts/payments">
+    The budget invariant and the payment states.
+  </Card>
+  <Card title="Known limitations" icon="circle-info" href="/resources/limitations">
+    What Selo does not do yet.
+  </Card>
+  <Card title="Output files" icon="file" href="/cli/files">
+    The run file, the gate summary and the attestation the CLI writes.
+  </Card>
+</CardGroup>

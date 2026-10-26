@@ -1,0 +1,265 @@
+---
+title: "The five release checks"
+description: "What each release check proves, how Selo measures it, and every result code it can report."
+icon: "list-check"
+sidebarTitle: "Release checks"
+---
+
+Every release test runs the same five checks, in the same order, against one authorized route. Each check answers one question a paying customer would ask, records the evidence behind its answer, and reports a status and a code. The [verdict](/concepts/verdicts) is computed from these five results and nothing else.
+
+## How a run is ordered
+
+| Order | Check | What Selo does | Requests to your endpoint |
+| --- | --- | --- | --- |
+| 1 | `handshake` | Sends an unpaid request and reads your `402` challenge | One unpaid request |
+| 2 | `paid_delivery` | Reserves budget, signs exactly your price, and sends one paid request | One paid request |
+| 3 | `response_contract` | Compares the paid response with your release contract | None. It reuses the paid response |
+| 4 | `discovery_contract` | Looks your route up in the Bazaar catalog and compares the listing with the live challenge | None. It reads the catalog only |
+| 5 | `retry_safety` | Replays the identical signed payment | One replay |
+
+Not every check always runs:
+
+- If `handshake` is not **PASS**, Selo pays nothing. The other four checks report `NOT_RUN` and the run concludes.
+- `response_contract` runs only when the paid request came back with a response. If your endpoint rejected the signed payment with a `402`, or the paid request never completed, it reports `NOT_RUN`.
+- `retry_safety` runs only after `paid_delivery` recorded a settlement, no payment is held as unresolved, and the authorization still covers the route.
+
+<Note>
+  Before the run, the free [preflight](/guides/preflight) sent one unpaid probe of its own. During the run, every request Selo sends to your endpoint carries an `Idempotency-Key` header holding an operation id. See [Payments and spend limits](/concepts/payments#operation-ids-and-idempotency-key).
+</Note>
+
+## Check results
+
+Each check produces one result object. The same shape appears in the release test response and the private report. The [signed attestation](/concepts/attestations) carries every field except `summary`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | One of `handshake`, `paid_delivery`, `response_contract`, `discovery_contract`, `retry_safety` |
+| `status` | string | `PASS`, `WARN`, `FAIL` or `INCONCLUSIVE` |
+| `code` | string | The specific outcome, listed per check below |
+| `blocking` | boolean | Whether the result can decide the verdict. Every check Selo runs today is blocking |
+| `summary` | string | A one-line explanation written from the measured values |
+| `evidence` | string array | Ids of the evidence records behind the result |
+
+| Status | Meaning |
+| --- | --- |
+| `PASS` | The behavior was observed and matches what a paying customer needs |
+| `WARN` | Nothing is broken, but something is missing or unconfirmed. A WARN with evidence does not block a PASS; it appears in `warnings` |
+| `FAIL` | Selo observed a defect and holds evidence of it |
+| `INCONCLUSIVE` | Selo could not establish the answer either way |
+
+Two codes can appear on any check, set by the runner rather than the check itself:
+
+| Code | Status | When |
+| --- | --- | --- |
+| `NOT_RUN` | INCONCLUSIVE | The check did not run: an earlier check stopped the run, its precondition was not met, or the 60-second job wall clock expired before it started |
+| `INTERNAL_ERROR` | INCONCLUSIVE | Selo hit an unexpected error, or restarted, while this check was in progress |
+
+## handshake
+
+**What it proves.** Your endpoint asks for payment correctly. An unpaid request gets a `402` with a decodable x402 v2 challenge that offers a payment Selo can make: the `exact` scheme, USDC on Algorand Mainnet, a positive price and a valid payee.
+
+**How Selo measures it.**
+
+1. Sends the authorized method to the authorized URL, with the request body from your preflight (POST only), through the [SSRF-safe fetch](/concepts/security). The timeout is 10 seconds and redirects are not followed.
+2. Reads the challenge from the `PAYMENT-REQUIRED` response header, a base64-encoded JSON object. The response body is not read.
+3. Requires `x402Version: 2` and picks the first `accepts` entry with `scheme: "exact"`, network `algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=` and asset `31566704`.
+4. Requires that entry's `amount` to be a positive integer of atomic units (micro-USDC) and its `payTo` to be a valid Algorand address.
+
+| Code | Status | When |
+| --- | --- | --- |
+| `HANDSHAKE_VALID` | PASS | A valid x402 v2 challenge with a supported requirement |
+| `NOT_PAYMENT_REQUIRED` | FAIL | The unpaid request answered with a status other than `402`, below `500` |
+| `CHALLENGE_MISSING` | FAIL | A `402` without a `PAYMENT-REQUIRED` header |
+| `CHALLENGE_MALFORMED` | FAIL | The header could not be decoded, or the decoded payload failed schema validation (`x402Version` number, `accepts` array whose entries carry `scheme`, `network`, `amount`, `asset` and `payTo` strings) |
+| `NO_SUPPORTED_REQUIREMENT` | FAIL | No `exact` entry for Algorand Mainnet USDC |
+| `PRICE_UNPARSEABLE` | FAIL | The matching entry's `amount` is not a positive integer string |
+| `PAY_TO_INVALID` | FAIL | The matching entry's `payTo` is not a valid Algorand address |
+| `UNSUPPORTED_X402_VERSION` | INCONCLUSIVE | The challenge declares an x402 version other than `2` |
+| `TARGET_UNAVAILABLE` | INCONCLUSIVE | The unpaid request answered with a `5xx` status |
+| `TARGET_TIMEOUT` | INCONCLUSIVE | No response within 10 seconds |
+| `NETWORK_UNAVAILABLE` | INCONCLUSIVE | DNS, connection or TLS failure |
+| `TARGET_BLOCKED` | INCONCLUSIVE | The safe fetch refused the request, for example because the hostname now resolves to a private address |
+
+**Evidence.** One `target_challenge` record: the status, content type, sanitized response headers, the decoded challenge and any decode error. Its SHA-256 is signed into the attestation as `targetChallengeSha256`.
+
+## paid_delivery
+
+**What it proves.** A paying customer gets what they paid for. Selo pays your price on chain and your endpoint answers with a `2xx` and a settlement that Selo can match to the transfer it signed.
+
+**How Selo measures it.**
+
+<Steps>
+  <Step title="Check its own wallet">
+    Selo reads its operating wallet before signing anything. If the wallet is below its ALGO minimum balance, is not opted in to USDC, or holds less USDC than your price, or if the Algorand node does not answer within 5 seconds, nothing is signed.
+  </Step>
+  <Step title="Reserve the amount">
+    The [spend guard](/concepts/payments#the-budget-invariant) reserves exactly your price in one conditional database update. A denial ends the check without signing.
+  </Step>
+  <Step title="Sign exactly the reserved requirement">
+    Selo's x402 client signs only the `accepts` entry whose scheme, network, asset, amount and `payTo` match the reservation, with the client's spend cap set to that amount. The entry must also carry `maxTimeoutSeconds` and an `extra` object, and the challenge a `resource.url`. If your challenge declares the x402 payment-identifier extension, Selo adds a payment id derived from the operation id.
+  </Step>
+  <Step title="Send one paid request">
+    The request carries the `PAYMENT-SIGNATURE` header, `Idempotency-Key: <jobId>:paid_delivery` and the same body as the probe. The timeout is 20 seconds, redirects are not followed, and the response body is read up to 256 KiB.
+  </Step>
+  <Step title="Match the settlement">
+    Selo reads the `PAYMENT-RESPONSE` header. A settlement with `success: true` and a non-empty `transaction` is your claim. Selo computes the id of the transfer it signed and records the payment as settled only when the two match.
+  </Step>
+</Steps>
+
+| Code | Status | When |
+| --- | --- | --- |
+| `PAID_AND_DELIVERED` | PASS | The payment settled and the response status is `2xx` |
+| `PAID_BUT_NOT_DELIVERED` | FAIL | The payment settled, then the response status was not `2xx` |
+| `PAID_REQUEST_REJECTED` | FAIL | Your endpoint answered the signed payment with a `402`, no settlement and no payer-side reason |
+| `PAYER_REJECTED` | INCONCLUSIVE | A `402` whose reason points at the payer: `invalid_exact_avm_simulation_failed`, `invalid_exact_avm_payment_not_signed`, `invalid_exact_avm_invalid_signature`, `insufficient_funds`, or a message about insufficient funds, overspend, minimum balance or opt-in |
+| `SETTLEMENT_UNCONFIRMED` | INCONCLUSIVE | A response without a settlement transaction id: no `PAYMENT-RESPONSE`, an unsuccessful one, or one that could not be decoded |
+| `SETTLEMENT_TX_MISMATCH` | INCONCLUSIVE | Your endpoint claimed a transaction id different from the transfer Selo signed |
+| `PAYMENT_UNRESOLVED` | INCONCLUSIVE | The outcome is unknown after the request was sent: a timeout, a connection lost after dispatch, a `402` with an undecodable `PAYMENT-RESPONSE`, or a transaction id already recorded on another payment |
+| `SPEND_GUARD_DENIED` | INCONCLUSIVE | The spend guard refused the payment. The summary names the [denial reason](/concepts/payments#spend-denial-reasons) |
+| `OPERATOR_WALLET_UNFUNDED` | INCONCLUSIVE | Selo's own wallet could not cover the payment. Nothing was signed |
+| `NETWORK_UNAVAILABLE` | INCONCLUSIVE | Selo could not read its wallet, or the paid request failed before it left Selo (signing failure, blocked address, connection error before dispatch). Nothing was sent |
+| `REQUIREMENT_NOT_PAYABLE` | INCONCLUSIVE | The live requirement could not be handed to the x402 client. Nothing was signed |
+
+<Warning>
+  Whenever a signed payment has left Selo without a settlement Selo can confirm, the payment is held **UNRESOLVED**. That covers `PAID_REQUEST_REJECTED`, `PAYER_REJECTED`, `SETTLEMENT_UNCONFIRMED`, `SETTLEMENT_TX_MISMATCH` and `PAYMENT_UNRESOLVED`. The amount keeps counting against the budget and Selo stops spending for the job. See [Held payments and reconciliation](/concepts/reconciliation).
+</Warning>
+
+**Evidence.** A `paid_response` record (status, content type, sanitized headers, claimed and settled transaction ids, the result of the transaction match, body SHA-256 and size, the first 2,048 characters of the body, and the SHA-256 of the payment header) and a `downstream_payment` record (the payment row: status, amount, network, asset, payee, transaction ids, timestamps and resolution reason).
+
+## response_contract
+
+**What it proves.** The response a paying customer receives is the one you promised. This is the check that blocks a release whose health check is green but whose paid response is wrong.
+
+**How Selo measures it.** It evaluates the response from `paid_delivery`. No new request is sent. The contract you send with the release test has three optional fields; see [Write a release contract](/guides/release-contract).
+
+| Field | Rule |
+| --- | --- |
+| `status` | Integer from `100` to `599`. Defaults to `200` when omitted, so a test without a contract still requires `200` |
+| `contentType` | A `type/subtype` media type. Compared case-insensitively on the media type only; parameters such as `charset` are ignored |
+| `jsonSchema` | A JSON Schema compiled by Ajv in strict mode, at most 16 KiB when serialized. A schema that does not compile is refused before you pay |
+
+Selo compares in a fixed order (status, then content type, then JSON parsing, then the schema) and reports the first failure. For a schema failure, the summary carries the first validation error, truncated to 200 characters.
+
+| Code | Status | When |
+| --- | --- | --- |
+| `CONTRACT_MATCHED` | PASS | Status, content type and schema all match |
+| `STATUS_MISMATCH` | FAIL | The paid response status differs from the expected status |
+| `CONTENT_TYPE_MISMATCH` | FAIL | The media type differs from the expected one |
+| `BODY_NOT_JSON` | FAIL | A schema is declared and the body is empty or not valid JSON |
+| `SCHEMA_MISMATCH` | FAIL | The body does not validate against the schema |
+| `BODY_TOO_LARGE` | INCONCLUSIVE | The paid body is larger than 256 KiB |
+| `BODY_READ_TIMEOUT` | INCONCLUSIVE | The body did not arrive before the paid request's deadline |
+| `BODY_READ_FAILED` | INCONCLUSIVE | The body stream failed |
+
+On Algorand Mainnet, the demo merchant's `broken-v1` release paid and answered `200`, and this check failed it with `SCHEMA_MISMATCH`: "Response body did not match the expected schema: must have required property 'receiptId'". See [Proof on Algorand Mainnet](/resources/mainnet-proof).
+
+**Evidence.** The `paid_response` record from `paid_delivery`, plus a `response_contract` record with the expected contract, the observed status, content type, body SHA-256 and size, and the resulting code. The contract's SHA-256 is signed into the attestation as `expectedContractSha256`.
+
+## discovery_contract
+
+**What it proves.** What buyers and agents discover about your route agrees with what your endpoint actually does: the same method, URL, payee and price, with enough metadata to use it.
+
+**How Selo measures it.**
+
+1. Reads the Bazaar discovery info from the live challenge (`extensions.bazaar.info`). If it declares `input.method` and that method differs from the tested method, the check fails at once.
+2. Looks your route up in the Bazaar catalog, scoped by payee: `GET https://facilitator.goplausible.xyz/discovery/resources?payTo=<your payTo>&limit=100&offset=<n>`. Selo pages through at most 20 pages, with 10 seconds per page and 20 seconds overall. A record matches when its `resourceUrl` equals the tested URL and its `method` equals the tested method.
+3. Compares a matching record with the live requirement: method, URL, an `accepts` entry with the same network, asset and `payTo`, and the same amount.
+4. Checks that a description, discovery info and an output example are present. Each can come from the live challenge or the catalog record.
+
+<Info>
+  The lookup is scoped by your payee address. A listing of the same URL under a different `payTo` is not compared; your route reads as not catalogued.
+</Info>
+
+| Code | Status | When |
+| --- | --- | --- |
+| `DISCOVERY_CONSISTENT` | PASS | The live challenge and the catalog record agree and carry usable metadata |
+| `LIVE_METHOD_MISMATCH` | FAIL | The live discovery info declares a method other than the tested one |
+| `CATALOG_RECORD_MALFORMED` | FAIL | The catalog record failed schema validation |
+| `CATALOG_METHOD_MISMATCH` | FAIL | The catalog record declares another method |
+| `CATALOG_URL_MISMATCH` | FAIL | The catalog record declares another resource URL |
+| `CATALOG_PAYMENT_MISMATCH` | FAIL | No catalogued payment entry has the live network, asset and `payTo` |
+| `CATALOG_PRICE_MISMATCH` | FAIL | The catalogued price differs from the live price |
+| `SPARSE_METADATA` | WARN | The record is consistent, but a description, discovery info or an output example is missing from both sources |
+| `NOT_CATALOGED` | WARN | Your route is not listed in the Bazaar catalog under your payee |
+| `CATALOG_UNAVAILABLE` | INCONCLUSIVE | The catalog could not be read |
+
+The metadata Selo reads lives in your decoded challenge, abridged here with placeholder values:
+
+```json PAYMENT-REQUIRED (decoded, abridged)
+{
+  "x402Version": 2,
+  "resource": {
+    "url": "https://api.example.com/v1/orders",
+    "description": "Create an order and return its receipt.",
+    "mimeType": "application/json"
+  },
+  "extensions": {
+    "bazaar": {
+      "info": {
+        "input": { "type": "http", "method": "POST", "bodyType": "json" },
+        "output": { "type": "json", "example": { "receiptId": "rcpt_123" } }
+      }
+    }
+  }
+}
+```
+
+**Evidence.** A `catalog_record` record: the tested URL and method, the lookup result, the catalog record when found, the reason when the catalog was unavailable, the live discovery info and the resulting code.
+
+## retry_safety
+
+**What it proves.** A client that retries a paid request with the same signed payment is not charged twice or served a second, different result.
+
+**How Selo measures it.** Selo first re-checks that the authorization is still verified, unexpired and covering the route. It then sends the identical `PAYMENT-SIGNATURE` header and the identical body again, with the same `Idempotency-Key` as the paid request (`<jobId>:paid_delivery`). The timeout is 20 seconds, and the replay body is read up to 1 MiB so it can be compared byte for byte with the paid response.
+
+| Replay answer | Outcome code | Status |
+| --- | --- | --- |
+| `408` or `429` | `INCONCLUSIVE` | INCONCLUSIVE |
+| Any other `4xx`, such as `402` or `409` | `PASS_REPLAY_REJECTED` | PASS |
+| `2xx` with the same settlement transaction id | `PASS_SAFE_RETRY` | PASS |
+| `2xx` with a different settlement transaction id | `FAIL_DUPLICATE_SIDE_EFFECT` | FAIL |
+| `2xx`, no transaction id, body byte-identical to the paid response | `PASS_SAFE_RETRY` | PASS |
+| `2xx`, no transaction id, different body, GET | `WARN_NO_IDEMPOTENCY_CONTRACT` | WARN |
+| `2xx`, no transaction id, different body, POST | `FAIL_DUPLICATE_SIDE_EFFECT` | FAIL |
+| Any `1xx`, `3xx` or `5xx` | `INCONCLUSIVE` | INCONCLUSIVE |
+| No answer within 20 seconds | `INCONCLUSIVE` | INCONCLUSIVE |
+| Network error | `INCONCLUSIVE` | INCONCLUSIVE |
+
+The outcome name is the check's `code`, and each outcome maps to exactly one status:
+
+| Outcome | Status |
+| --- | --- |
+| `PASS_SAFE_RETRY` | PASS |
+| `PASS_REPLAY_REJECTED` | PASS |
+| `WARN_NO_IDEMPOTENCY_CONTRACT` | WARN |
+| `FAIL_DUPLICATE_SIDE_EFFECT` | FAIL |
+| `INCONCLUSIVE` | INCONCLUSIVE |
+
+A replay that reports a second settlement also raises an operator alert. When the replay does not run, the check reports `NOT_RUN`. If the reason is that the authorization lapsed after the paid call, the run also records `AUTHORIZATION_LAPSED`.
+
+<Tip>
+  Two behaviors pass: reject a replayed payment that already settled with a `4xx`, or return the stored result (the same settlement transaction id or a byte-identical body). The demo merchant's `fixed-v2` release answered the replay with `402` and passed with `PASS_REPLAY_REJECTED`.
+</Tip>
+
+**Evidence.** A `replay_response` record (the idempotency key, the original transaction id, the replay's status, transaction id, sanitized headers, body SHA-256 and size, and whether the body matched the paid response) and an `authorization_snapshot` taken just before the replay.
+
+## The job wall clock
+
+A job has 60 seconds from the moment Selo starts running it. When the clock runs out, requests in flight are aborted, and `paid_delivery`, `discovery_contract` and `retry_safety` report `NOT_RUN` if they have not started. The run records `TARGET_TIMEOUT` as its reason unless it already recorded another one, and the verdict is INCONCLUSIVE unless a check already proved a FAIL.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Verdicts and the gate" icon="scale-balanced" href="/concepts/verdicts">
+    How five results become PASS, FAIL or INCONCLUSIVE, and how the CLI turns that into an exit code.
+  </Card>
+  <Card title="Write a release contract" icon="file-code" href="/guides/release-contract">
+    Declare the status, content type and JSON schema your paid response must meet.
+  </Card>
+  <Card title="Payments and spend limits" icon="coins" href="/concepts/payments">
+    The reservation, the payment states and the budget behind `paid_delivery`.
+  </Card>
+  <Card title="Errors and reason codes" icon="triangle-exclamation" href="/api-reference/errors">
+    Every error and reason code the API returns.
+  </Card>
+</CardGroup>

@@ -1,0 +1,157 @@
+---
+title: "Held payments and reconciliation"
+description: "What an UNRESOLVED downstream payment is, why Selo holds it instead of guessing, and how the operator resolves it only on chain proof."
+icon: "arrows-rotate"
+sidebarTitle: "Reconciliation"
+---
+
+Sometimes Selo cannot tell whether a payment it signed has settled. When that happens it does not guess. It holds the payment as **UNRESOLVED**, stops spending for the job, and leaves the answer to the chain: the operator's `reconcile` command later settles or releases the payment only on proof from the Algorand indexer.
+
+## What an UNRESOLVED payment is
+
+A downstream payment becomes `UNRESOLVED` when a signed payment has left Selo, or may have left it, and Selo has no settlement it can confirm. That happens when:
+
+- your endpoint answered without a settlement transaction id;
+- your endpoint claimed a transaction id different from the transfer Selo signed;
+- the claimed transaction id is already recorded on another payment;
+- your endpoint rejected the signed payment with a `402` (a signed transfer can still be submitted until it expires);
+- the request timed out or lost its connection after it left Selo, or a `402` carried an undecodable `PAYMENT-RESPONSE`;
+- Selo hit an internal error, or restarted, while the payment was open.
+
+At that moment Selo raises an operator alert, and the job changes in four ways:
+
+| Effect | Detail |
+| --- | --- |
+| Budget | The amount moves from `reserved` to `unresolved` and keeps counting against the job budget |
+| Spending | The spend guard refuses every further reservation, and `retry_safety` does not replay |
+| Verdict | The run records `PAYMENT_UNRESOLVED`, so the verdict is INCONCLUSIVE unless a check already proved a FAIL |
+| Report | `money.unresolvedSpendUsdc` shows the amount, and the payment is listed with status `UNRESOLVED` and the `expectedTxId` Selo signed |
+
+See [Payments and spend limits](/concepts/payments#why-ambiguity-stops-spending) for why a timeout never releases capacity.
+
+## Why absence is not proof
+
+An Algorand transaction is valid only up to its **last valid round**. Until the network passes that round, a signed transfer that is not on chain yet can still be submitted and confirmed. Once the network is past it, the transfer can never be confirmed.
+
+So there are exactly two kinds of proof:
+
+- **It settled**: the indexer shows a confirmed transfer that matches the payment.
+- **It never will**: the indexer does not have Selo's own signed transfer, and the indexer's current round is past that transfer's last valid round.
+
+Anything else is not proof, and the payment stays held. When Selo signs a downstream payment, it records the id of the transfer it signed and the transfer's last valid round on the payment row, so that both proofs are possible later.
+
+## The reconcile command
+
+Reconciliation is an operator command run against Selo's own database. It never signs, never pays and never changes a verdict.
+
+```bash Terminal
+pnpm --filter @selo/api reconcile -- --limit 50
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `--limit` | How many `UNRESOLVED` payments to examine, oldest first. From 1 to 200; default 50 |
+| `DATABASE_URL` | Selo's database |
+| `SELO_OPERATOR_MNEMONIC` | Used only to derive Selo's operating address, the expected sender of every downstream transfer. The loaded configuration keeps the address, not the mnemonic |
+
+## How each payment is judged
+
+<Steps>
+  <Step title="Wait for the verdict">
+    A payment whose job has not reached a verdict is held with `job_active`. Reconciliation runs only after the job has concluded.
+  </Step>
+  <Step title="Pick the network">
+    The payment's network must be Algorand Mainnet or Testnet; otherwise it is held with `unsupported_network`.
+  </Step>
+  <Step title="Pick the transaction id">
+    Selo looks up the transfer it signed (`expectedTxId`). If no signed id was derived, it falls back to the id your endpoint claimed. With neither, the payment is held with `no_transaction_id` and the indexer is not asked.
+  </Step>
+  <Step title="Ask the indexer">
+    One `GET <indexer>/v2/transactions?txid=<id>` to `https://mainnet-idx.algonode.cloud` or `https://testnet-idx.algonode.cloud`, with a 10-second timeout, redirects refused and the answer capped at 262,144 bytes. The answer gives the transaction, if known, and the indexer's current round.
+  </Step>
+  <Step title="Decide">
+    Settle, release or hold, using the table below.
+  </Step>
+</Steps>
+
+## Decision table
+
+| What the indexer shows | Outcome | Reason |
+| --- | --- | --- |
+| A confirmed asset transfer whose asset, receiver, amount and sender (Selo's operating address) all match the payment | **Settle**: `UNRESOLVED` to `SETTLED`, recording the transaction id and the confirmation time | None |
+| Selo's signed transfer is absent, and the current round is past the recorded last valid round | **Release**: `UNRESOLVED` to `RELEASED` | None |
+| Absent, and the current round is not yet past the last valid round | Hold | `not_found_still_valid` |
+| Absent, and no last valid round was recorded, or the id was only claimed by your endpoint and never signed by Selo | Hold | `no_last_valid_round` |
+| A transaction that is not an asset transfer, or whose asset, receiver, amount or sender differs | Hold and alert | `conflicting_transaction` |
+| A matching transaction without a confirmed round and round time | Hold | `unconfirmed` |
+| A confirmed transaction id already recorded on another payment | Hold | `duplicate_tx` |
+| A non-`200` status or a failed connection | Hold | `indexer_unavailable` |
+| No complete answer within 10 seconds | Hold | `indexer_timeout` |
+| An answer that is not JSON, not a transaction search result, too large, or about a different transaction | Hold | `indexer_malformed` |
+
+<Warning>
+  A transfer that went to a different receiver, or moved a different asset or amount, never settles the payment. It is held with `conflicting_transaction` and raises an alert for the operator to investigate.
+</Warning>
+
+## Each change is one conditional update
+
+A settle or release is a conditional `UPDATE` on the payment row that applies only while its status is still `UNRESOLVED`, plus the matching move of the job's counters, in one transaction:
+
+| Change | `unresolved` | `settled` |
+| --- | --- | --- |
+| Settle | minus amount | plus amount |
+| Release | minus amount | unchanged |
+
+The payment keeps the reason it was held: the new resolution reason is appended in front of it, for example `reconciled: confirmed on chain in round <n> as tx <txId>; held because: <original reason>`.
+
+Because each change is conditional, reconciliation is safe to repeat and to run in parallel:
+
+- Two reconcilers on separate connections settle or release a payment exactly once; the other sees it as already resolved.
+- A second run after a settlement finds nothing to do and changes nothing.
+- A held payment stays exactly as it was across repeated runs.
+- A run stopped after reading converges on the next run, and its late write changes nothing.
+- If the job's counters cannot move, the payment change rolls back with them.
+
+## Output
+
+```text Output format
+reconciling up to <limit> UNRESOLVED payments for <operating address>
+<paymentId> job=<jobId> amount=<amount> USDC SETTLED tx=<txId> round=<round>
+<paymentId> job=<jobId> amount=<amount> USDC RELEASED absent at round <round>, past last valid round <round>
+<paymentId> job=<jobId> amount=<amount> USDC ALREADY_RESOLVED now <status>
+<paymentId> job=<jobId> amount=<amount> USDC UNRESOLVED <reason>: <detail>
+<paymentId> job=<jobId> amount=<amount> USDC FAILED <detail>
+checked=<n> settled=<n> released=<n> already_resolved=<n> held=<n> failed=<n> still_unresolved=<n>
+```
+
+The command exits `1` while any payment in the database is still `UNRESOLVED` or any row failed, and `0` once nothing is left to resolve. Every held payment raises a `downstream_still_unresolved` alert with its reason, and every failed row a `downstream_reconcile_failed` alert.
+
+## What you see afterwards
+
+- The private report reads the payment rows each time you open it. A reconciled payment shows its new status, a settled one adds its transaction id to `money.downstreamTxIds`, and `money.unresolvedSpendUsdc` drops.
+- The verdict and its reason do not change. A run whose payment was unresolved stays INCONCLUSIVE, because the test itself could not confirm the payment when it ran.
+
+## Payments signed before 26 October 2026
+
+Selo has recorded each signed payment's last valid round since 26 October 2026. Payments signed before then have no last valid round, so reconciliation can settle them on a confirmed matching transfer but can never release them.
+
+## Held inbound payments
+
+Reconciliation covers downstream payments only. When the facilitator does not confirm the outcome of **your** payment to Selo, the job is held INCONCLUSIVE with `FACILITATOR_UNAVAILABLE`, never runs, and answers `502 INBOUND_SETTLEMENT_UNRESOLVED`. Do not pay again for that request. Such a held inbound settlement is still resolved by hand. See [Recover an interrupted run](/guides/resume).
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Payments and spend limits" icon="coins" href="/concepts/payments">
+    The payment states and the budget invariant.
+  </Card>
+  <Card title="Verdicts and the gate" icon="scale-balanced" href="/concepts/verdicts">
+    Why `PAYMENT_UNRESOLVED` blocks a release.
+  </Card>
+  <Card title="Recover an interrupted run" icon="rotate-right" href="/guides/resume">
+    What to do when your own payment to Selo is unconfirmed.
+  </Card>
+  <Card title="Known limitations" icon="circle-info" href="/resources/limitations">
+    What is still handled by hand.
+  </Card>
+</CardGroup>

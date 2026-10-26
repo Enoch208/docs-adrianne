@@ -1,0 +1,403 @@
+---
+title: "Signed attestations"
+description: "The Ed25519-signed record of a release test: every payload field, the exact bytes Selo signs, and how to verify one with any Ed25519 library."
+icon: "signature"
+sidebarTitle: "Signed attestations"
+---
+
+An attestation is Selo's signed statement of what a release test found: which target and release were tested, the verdict, every check result, both payment legs and a hash of every evidence record. It is signed with Ed25519 under a published key, so anyone holding the file can check it offline without trusting the machine that delivered it.
+
+## When Selo issues one
+
+- Every release test response that carries a verdict includes an `attestation` object, as long as the Selo deployment has a signing key. `api.useselo.xyz` signs with the key `selo-ed25519-728fcf85650b128f`.
+- A duplicate request for the same job returns a byte-identical attestation. Ed25519 signatures are deterministic, and the payload is built from the stored job.
+- `selo test --attestation <file.json>` saves it, and the GitHub Action's `test` mode saves it so that a later `verify` step can check it. The private report link does not include it, so keep the file.
+
+## The envelope
+
+```json Envelope
+{
+  "payload": { "schemaVersion": "selo.release.v1", "...": "..." },
+  "signature": {
+    "algorithm": "Ed25519",
+    "keyId": "selo-ed25519-728fcf85650b128f",
+    "value": "<base64url Ed25519 signature>"
+  }
+}
+```
+
+<ResponseField name="payload" type="object" required>
+  The signed statement. Every field is listed below.
+</ResponseField>
+<ResponseField name="signature" type="object" required>
+  <Expandable title="properties">
+    <ResponseField name="algorithm" type="string" required>
+      Always `Ed25519`.
+    </ResponseField>
+    <ResponseField name="keyId" type="string" required>
+      The id of the key that signed, as listed in the key set.
+    </ResponseField>
+    <ResponseField name="value" type="string" required>
+      The 64-byte Ed25519 signature, base64url-encoded without padding.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Payload fields
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schemaVersion` | string | Always `selo.release.v1` |
+| `issuer` | string | The origin of the Selo deployment that signed, for example `https://api.useselo.xyz` |
+| `jobId` | string | The release job, `job_…` |
+| `testedTarget.url` | string | The tested URL, normalized |
+| `testedTarget.method` | string | `GET` or `POST` |
+| `deployment` | object or null | `{ "id": "<release id>", "verification": "asserted_by_client" }` when the paid request carried a `deploymentId` (the CLI's `--release`), otherwise `null` |
+| `testedAt` | string or null | When the run started, ISO 8601. If the run never started, the completion time |
+| `completedAt` | string | When the job concluded, ISO 8601 |
+| `seloVersion` | string | The commit of the Selo build that ran the test, or `unknown` |
+| `verdict` | string | `PASS`, `FAIL` or `INCONCLUSIVE` |
+| `inconclusiveReason` | string or null | The [inconclusive reason](/concepts/verdicts#inconclusive-reasons), or `null` |
+| `checks` | array | One entry per check: `id`, `status`, `code`, `blocking` and `evidence`. The human-readable `summary` is not signed |
+| `expectedContractSha256` | string or null | SHA-256 (hex) of the canonical JSON of the release contract you sent, or `null` without one |
+| `targetChallengeSha256` | string or null | The SHA-256 of the recorded `target_challenge` evidence, which holds your decoded `402` challenge |
+| `payments.network` | string | CAIP-2 network id, `algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=` on Mainnet |
+| `payments.asset` | string | USDC asset id, `31566704` on Mainnet |
+| `payments.inboundTxId` | string or null | The transaction that paid Selo |
+| `payments.inboundAmountUsdc` | string or null | The inbound amount as a decimal, for example `1.00` |
+| `payments.downstream` | array | Every downstream payment: `status` (`RESERVED`, `SETTLED`, `RELEASED` or `UNRESOLVED`), `amountUsdc` and `txId` |
+| `evidenceSha256` | string | SHA-256 (hex) of the canonical JSON of the `evidence` array |
+| `evidence` | array | Every evidence record of the job, sorted by id: `id`, `kind` and `sha256` |
+
+### Release ids are asserted by the client
+
+`deployment.verification` is always `asserted_by_client`. The release id is the label your CLI or workflow sent with the paid request. Selo signs that the test ran against the URL under that label; it does not inspect your infrastructure to confirm which build was serving. Bind the id to something you control, such as a commit SHA, and test the URL that the release actually serves.
+
+### The evidence manifest
+
+Each evidence record's `sha256` is the SHA-256 of the canonical JSON of the sanitized record that Selo stored. The kinds are `target_challenge`, `paid_response`, `downstream_payment`, `response_contract`, `catalog_record`, `replay_response` and `authorization_snapshot`. The records themselves are private; the manifest commits to their exact content, and `evidenceSha256` commits to the manifest.
+
+## Canonical JSON
+
+Selo signs the canonical JSON of the payload, produced by this function from `packages/core/src/canonical.ts`:
+
+```ts packages/core/src/canonical.ts
+function ordered(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(ordered);
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, entry]) => [key, ordered(entry)]),
+    );
+  }
+  return value;
+}
+
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(ordered(value));
+}
+```
+
+The rules:
+
+- Object keys are sorted at every depth, by UTF-16 code unit (JavaScript's default string order). Every payload key is ASCII.
+- Arrays keep their order.
+- No whitespace between tokens.
+- Strings are escaped as `JSON.stringify` escapes them; non-ASCII characters are written as-is.
+- The payload holds no floating-point numbers. Amounts are decimal strings.
+
+## The exact bytes signed
+
+<Steps>
+  <Step title="Serialize">
+    Take the `payload` object exactly as it appears in the envelope and serialize it to canonical JSON.
+  </Step>
+  <Step title="Encode">
+    Encode that string as UTF-8. These bytes are the message.
+  </Step>
+  <Step title="Sign">
+    Selo signs the message with pure Ed25519 (no pre-hashing) and stores the 64-byte signature as base64url without padding in `signature.value`.
+  </Step>
+</Steps>
+
+## The key set
+
+Selo publishes its public keys at a well-known URL, served with `Cache-Control: public, max-age=300`:
+
+```bash Terminal
+curl https://api.useselo.xyz/.well-known/selo-attestation-keys.json
+```
+
+```json selo-attestation-keys.json
+{
+  "keys": [
+    {
+      "keyId": "selo-ed25519-728fcf85650b128f",
+      "algorithm": "Ed25519",
+      "publicKey": "IiUpeUTzfsbOg5-hV6i3eLnqU4uJ7hog31HmgXoc0ZQ"
+    }
+  ]
+}
+```
+
+- `publicKey` is the raw 32-byte Ed25519 public key, base64url-encoded: the `x` member of an OKP JSON Web Key.
+- `keyId` is `selo-ed25519-` followed by the first 16 hex characters of the SHA-256 of those 32 bytes.
+
+<Tip>
+  For a gate, pin the key. Save the key set as a file in your repository and verify against that file, so that a change at the URL cannot change what your gate trusts.
+</Tip>
+
+## Verify with the CLI
+
+```bash Terminal
+pnpm selo verify \
+  --attestation selo-attestation.json \
+  --keys https://api.useselo.xyz/.well-known/selo-attestation-keys.json \
+  --release fixed-v2 \
+  --url https://demo.useselo.xyz/v1/orders \
+  --method POST
+```
+
+Run against the demo merchant's `fixed-v2` attestation from Algorand Mainnet, it prints:
+
+```text Output
+verified    signature by selo-ed25519-728fcf85650b128f (issuer https://api.useselo.xyz)
+release     fixed-v2 (asserted by the caller when tested)
+target      POST https://demo.useselo.xyz/v1/orders
+job         job_51AZ2WJZ78RF1WZC316Q1K38GG
+verdict     PASS
+inbound     EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA
+downstream  QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ
+```
+
+`selo verify` checks, in this order, and refuses at the first failure:
+
+| Check | Refusal message |
+| --- | --- |
+| The file is a `{ payload, signature }` envelope with the expected fields | `the file is not a Selo release attestation` |
+| `signature.keyId` is in the trusted key set | `it is signed by <keyId>, which is not among the trusted keys` |
+| The Ed25519 signature verifies over the canonical payload | `the signature does not verify; the attestation was altered or forged` |
+| `schemaVersion` is `selo.release.v1` | `unsupported schema <version>` |
+| `deployment.id` equals `--release` | `it attests release <id or (none)>, not <release>` |
+| `testedTarget` equals `--url` and `--method` | `it attests <method> <url>, not <method> <url>` |
+
+A refusal prints `not verified: <message>` and exits `2`. A verified attestation exits with its verdict: `0` for PASS, `1` for FAIL, `2` for INCONCLUSIVE. `--keys` takes an `https` URL or a local file; an `http` URL is refused as invalid input with exit `3`. Checking the release id and target matters: a valid PASS for another release, another URL or no release at all cannot open your gate. See [selo verify](/cli/verify) and [Verify a signed verdict](/guides/verify-attestation).
+
+## Verify with any Ed25519 library
+
+You do not need Selo's code. Rebuild the canonical JSON of `payload`, encode it as UTF-8, decode the base64url signature and public key, and run a standard Ed25519 verification. This Node.js script, tested with Node.js 24 against the Mainnet evidence files, does exactly that with the built-in `node:crypto` module:
+
+```js verify-attestation.mjs
+import { createPublicKey, verify } from "node:crypto";
+import { readFileSync } from "node:fs";
+
+function canonical(value) {
+  if (Array.isArray(value)) {
+    return value.map(canonical);
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+        .map((key) => [key, canonical(value[key])]),
+    );
+  }
+  return value;
+}
+
+const [attestationFile, keysFile] = process.argv.slice(2);
+const { payload, signature } = JSON.parse(readFileSync(attestationFile, "utf8"));
+const { keys } = JSON.parse(readFileSync(keysFile, "utf8"));
+
+const key = keys.find((candidate) => candidate.keyId === signature.keyId);
+if (key === undefined || signature.algorithm !== "Ed25519") {
+  throw new Error(`untrusted key ${signature.keyId}`);
+}
+
+const publicKey = createPublicKey({
+  key: { kty: "OKP", crv: "Ed25519", x: key.publicKey },
+  format: "jwk",
+});
+const message = Buffer.from(JSON.stringify(canonical(payload)), "utf8");
+const valid = verify(null, message, publicKey, Buffer.from(signature.value, "base64url"));
+
+console.log(valid ? `valid: ${payload.verdict} for ${payload.jobId}` : "INVALID");
+process.exitCode = valid ? 0 : 1;
+```
+
+```bash Terminal
+node verify-attestation.mjs selo-attestation.json selo-attestation-keys.json
+```
+
+The script checks the signature only. Compare `payload.deployment.id`, `payload.testedTarget` and `payload.verdict` with what you expect before you trust the result, as `selo verify` does.
+
+<Note>
+  In other languages, use a JSON encoder that sorts keys, omits whitespace and leaves non-ASCII characters unescaped, and compare its output with the rules above. In Python, `json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()` matches Selo's bytes for both Mainnet evidence files.
+</Note>
+
+## What a valid attestation proves
+
+<AccordionGroup>
+  <Accordion title="What it proves">
+    - Selo's key signed this exact verdict, these check results and this evidence manifest for this job.
+    - The test ran against the stated URL and method, under the stated release label.
+    - The payment transaction ids are the ones Selo recorded. Both are public on Algorand: look them up at `https://allo.info/tx/<txId>`.
+    - Not one signed field has changed since Selo signed it.
+  </Accordion>
+  <Accordion title="What it does not prove">
+    - Which build your infrastructure was serving. The release id is asserted by the caller.
+    - That your endpoint still behaves the same way today. An attestation describes one run at `completedAt`.
+    - The content of the evidence records, which stay private to Selo. The manifest only fixes their hashes.
+  </Accordion>
+</AccordionGroup>
+
+## Example from Algorand Mainnet
+
+The demo merchant's `fixed-v2` release, tested on 26 October 2026:
+
+<Accordion title="g5-release-gate-fixed-v2-attestation.json">
+
+```json g5-release-gate-fixed-v2-attestation.json
+{
+  "payload": {
+    "schemaVersion": "selo.release.v1",
+    "issuer": "https://api.useselo.xyz",
+    "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+    "testedTarget": {
+      "url": "https://demo.useselo.xyz/v1/orders",
+      "method": "POST"
+    },
+    "deployment": {
+      "id": "fixed-v2",
+      "verification": "asserted_by_client"
+    },
+    "testedAt": "2026-10-26T10:24:02.883Z",
+    "completedAt": "2026-10-26T10:24:12.218Z",
+    "seloVersion": "71080ad",
+    "verdict": "PASS",
+    "inconclusiveReason": null,
+    "checks": [
+      {
+        "id": "handshake",
+        "status": "PASS",
+        "code": "HANDSHAKE_VALID",
+        "blocking": true,
+        "evidence": ["evd_B23GQN052SFAET2QME89MVYX5G"]
+      },
+      {
+        "id": "paid_delivery",
+        "status": "PASS",
+        "code": "PAID_AND_DELIVERED",
+        "blocking": true,
+        "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"]
+      },
+      {
+        "id": "response_contract",
+        "status": "PASS",
+        "code": "CONTRACT_MATCHED",
+        "blocking": true,
+        "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW"]
+      },
+      {
+        "id": "discovery_contract",
+        "status": "PASS",
+        "code": "DISCOVERY_CONSISTENT",
+        "blocking": true,
+        "evidence": ["evd_TE2XZJB33D4CXHV2EMW84SS6BG"]
+      },
+      {
+        "id": "retry_safety",
+        "status": "PASS",
+        "code": "PASS_REPLAY_REJECTED",
+        "blocking": true,
+        "evidence": ["evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R"]
+      }
+    ],
+    "expectedContractSha256": "6e5b149b1088d214be6a1c097e2e06bf1127fe529c544731023abea7b03e7170",
+    "targetChallengeSha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc",
+    "payments": {
+      "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+      "asset": "31566704",
+      "inboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+      "inboundAmountUsdc": "1.00",
+      "downstream": [
+        {
+          "status": "SETTLED",
+          "amountUsdc": "0.01",
+          "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"
+        }
+      ]
+    },
+    "evidenceSha256": "49d787f15e7001a408f495aa59f4b16214dca58838e9e99ddd4790f6d6565a96",
+    "evidence": [
+      {
+        "id": "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+        "kind": "paid_response",
+        "sha256": "7815cd18d10df182be8f325d6d7a3b67800060da3efeff5c9c01fd409794398b"
+      },
+      {
+        "id": "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R",
+        "kind": "replay_response",
+        "sha256": "a72223caf72ed2bd2d24114062b7cb15655f0d0e9c8cd4442a3bac9e791cae85"
+      },
+      {
+        "id": "evd_B23GQN052SFAET2QME89MVYX5G",
+        "kind": "target_challenge",
+        "sha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc"
+      },
+      {
+        "id": "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW",
+        "kind": "response_contract",
+        "sha256": "f3f8cef64a663df7d7c192ff542878b6653df048b227305e50457bab0fab4bd0"
+      },
+      {
+        "id": "evd_MVWEZKMTNT45MWX6RDA8G6HRQ0",
+        "kind": "authorization_snapshot",
+        "sha256": "207c2d476ea56e68e5bb88fa34ac5a943912be83251088a30f93f99c515626da"
+      },
+      {
+        "id": "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4",
+        "kind": "downstream_payment",
+        "sha256": "cca974ffefb3a23f9528745f1c205e58fc5687e8ef18a0bab527f110fedf609e"
+      },
+      {
+        "id": "evd_SXXV98XNSNVMPPPF7R7YR2RSC8",
+        "kind": "authorization_snapshot",
+        "sha256": "208afc651b36a13f9b93c2decb89cc70558559c709d67ca83606ae65bb2f54e1"
+      },
+      {
+        "id": "evd_TE2XZJB33D4CXHV2EMW84SS6BG",
+        "kind": "catalog_record",
+        "sha256": "4503636c21768df0807c0dfd88ba1813a9f2fdf9629bdf59fce723ed21e25712"
+      }
+    ]
+  },
+  "signature": {
+    "algorithm": "Ed25519",
+    "keyId": "selo-ed25519-728fcf85650b128f",
+    "value": "E3lC29kTmj4Ts8SVoEDFabdAGGAO7ZZs4n9p2P7HUWGePMfi4aO75xQ-v7cynT1T4nT6mB2iQZYAzXe2YIbeBg"
+  }
+}
+```
+
+</Accordion>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Verify a signed verdict" icon="circle-check" href="/guides/verify-attestation">
+    Step-by-step verification in a terminal and in CI.
+  </Card>
+  <Card title="selo verify" icon="terminal" href="/cli/verify">
+    Every flag and exit code of the verify command.
+  </Card>
+  <Card title="Verdicts and the gate" icon="scale-balanced" href="/concepts/verdicts">
+    How the signed verdict is computed.
+  </Card>
+  <Card title="Proof on Algorand Mainnet" icon="link" href="/resources/mainnet-proof">
+    Both demo releases, their transactions and their attestations.
+  </Card>
+</CardGroup>

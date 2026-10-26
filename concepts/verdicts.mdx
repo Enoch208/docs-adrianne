@@ -1,0 +1,208 @@
+---
+title: "Verdicts and the gate"
+description: "How Selo reduces five check results to PASS, FAIL or INCONCLUSIVE, and how the CLI turns that verdict into an exit code."
+icon: "scale-balanced"
+sidebarTitle: "Verdicts and the gate"
+---
+
+A release test ends in exactly one verdict: **PASS**, **FAIL** or **INCONCLUSIVE**. The verdict is computed by a small, pure function from the five [check results](/concepts/checks) and one optional reason. No model, heuristic or person decides it, and the same inputs always produce the same verdict.
+
+## The three verdicts
+
+| Verdict | Meaning | What the gate does |
+| --- | --- | --- |
+| `PASS` | Every check is present, no blocking check failed or was inconclusive, and every blocking check carries evidence | Allows the release (exit `0`) when the report is also fully evidenced |
+| `FAIL` | At least one blocking check failed, and Selo holds evidence of the failure | Blocks the release (exit `1`) |
+| `INCONCLUSIVE` | Selo could not prove the release good or bad. The `inconclusiveReason` says why | Blocks the release (exit `2`) |
+
+There is no fourth verdict for errors. A failure inside Selo becomes INCONCLUSIVE with the reason `INTERNAL_ERROR`.
+
+## The reducer
+
+The rule runs in this order and stops at the first match:
+
+<Steps>
+  <Step title="Any proven blocking FAIL gives FAIL">
+    If any blocking check has status `FAIL` and at least one evidence id, the verdict is **FAIL**. This wins over everything else, including a reason recorded during the run.
+  </Step>
+  <Step title="A recorded reason gives INCONCLUSIVE">
+    Otherwise, if the run recorded an inconclusive reason (a timeout, an unresolved payment, a lapsed authorization and so on), the verdict is **INCONCLUSIVE** with that reason.
+  </Step>
+  <Step title="Missing or unproven results give INCONCLUSIVE">
+    Otherwise, if any check is missing, or any blocking check is `INCONCLUSIVE` or has no evidence, the verdict is **INCONCLUSIVE** with `EVIDENCE_INCOMPLETE`.
+  </Step>
+  <Step title="Everything else is PASS">
+    Otherwise the verdict is **PASS**. Blocking `WARN` results with evidence do not prevent it; they are listed in `warnings`.
+  </Step>
+</Steps>
+
+This is the function, as it ships in `packages/core/src/verdict.ts`:
+
+```ts packages/core/src/verdict.ts
+export function reduceVerdict(
+  checks: readonly CheckResult[],
+  abort: InconclusiveReason | null,
+): VerdictOutcome {
+  const byId = indexById(checks);
+  const warnings = collectWarnings(byId);
+  const blockingFailures = findProvenFailures(byId);
+
+  if (blockingFailures.length > 0) {
+    return { verdict: "FAIL", inconclusiveReason: null, blockingFailures, warnings };
+  }
+
+  if (abort !== null) {
+    return { verdict: "INCONCLUSIVE", inconclusiveReason: abort, blockingFailures: [], warnings };
+  }
+
+  if (hasIncompleteEvidence(byId)) {
+    return {
+      verdict: "INCONCLUSIVE",
+      inconclusiveReason: "EVIDENCE_INCOMPLETE",
+      blockingFailures: [],
+      warnings,
+    };
+  }
+
+  return { verdict: "PASS", inconclusiveReason: null, blockingFailures: [], warnings };
+}
+```
+
+- `indexById` rejects a result set that contains the same check twice.
+- `findProvenFailures` returns the blocking checks with status `FAIL` and a non-empty `evidence` list.
+- `hasIncompleteEvidence` is true when any of the five checks is missing, or a blocking check is `INCONCLUSIVE` or has an empty `evidence` list.
+- `collectWarnings` returns `"<check id>: <summary>"` for every `WARN`, and for any non-blocking `FAIL` or `INCONCLUSIVE`.
+
+The result does not depend on the order of the checks; the test suite runs every permutation of a five-check set.
+
+## Decision table
+
+| Checks | Recorded reason | Verdict | `inconclusiveReason` |
+| --- | --- | --- | --- |
+| A blocking check is `FAIL` with evidence | Any, or none | `FAIL` | `null` |
+| A blocking check is `FAIL` without evidence, no proven FAIL elsewhere | None | `INCONCLUSIVE` | `EVIDENCE_INCOMPLETE` |
+| No proven FAIL | Present | `INCONCLUSIVE` | The recorded reason |
+| No proven FAIL, a blocking check is `INCONCLUSIVE` | None | `INCONCLUSIVE` | `EVIDENCE_INCOMPLETE` |
+| No proven FAIL, a check is missing | None | `INCONCLUSIVE` | `EVIDENCE_INCOMPLETE` |
+| No proven FAIL, a blocking `PASS` or `WARN` has no evidence | None | `INCONCLUSIVE` | `EVIDENCE_INCOMPLETE` |
+| All five present, every blocking check `PASS` or `WARN` with evidence | None | `PASS` | `null` |
+
+Every check Selo runs today is blocking, so in practice every result counts.
+
+## How the recorded reason is chosen
+
+While a job runs, a step that cannot reach a definite answer records an inconclusive reason. The run keeps the first reason it records, with one exception: `PAYMENT_UNRESOLVED` replaces any earlier reason, because a payment with an unknown outcome is the most important thing to report. When the job's 60-second wall clock has expired by the time the run concludes and no reason was recorded, the reason is `TARGET_TIMEOUT`.
+
+## Inconclusive reasons
+
+| Reason | Meaning | Recorded when |
+| --- | --- | --- |
+| `NETWORK_UNAVAILABLE` | A network exchange could not complete | The unpaid request could not connect or was blocked by the safe fetch; the paid request failed before it left Selo; the paid body stream failed; the replay hit a network error; Selo could not read its own wallet |
+| `FACILITATOR_UNAVAILABLE` | A facilitator service did not give a usable answer | The Bazaar catalog could not be read for `discovery_contract`. A job whose inbound payment the facilitator could not confirm also carries this reason; it never runs and has no report |
+| `TARGET_TIMEOUT` | Your endpoint or the job ran out of time | The unpaid request got no answer in 10 seconds; the paid body did not arrive before its deadline; the replay got no answer in 20 seconds; the 60-second job wall clock expired |
+| `BUDGET_EXHAUSTED` | The spend guard refused the payment on budget grounds | `SCENARIO_BUDGET_EXCEEDED`, `JOB_BUDGET_EXCEEDED` or `ABSOLUTE_CAP_EXCEEDED` |
+| `PAYMENT_UNRESOLVED` | A downstream payment's outcome is unknown | A signed payment left Selo without a settlement Selo could confirm, or the spend guard found an unresolved amount outstanding. See [Held payments and reconciliation](/concepts/reconciliation) |
+| `EVIDENCE_INCOMPLETE` | Selo cannot prove the result either way | No other reason was recorded, but a check is missing, inconclusive or without evidence. Also recorded directly when the paid body exceeds 256 KiB or the live requirement could not be handed to the x402 client |
+| `AUTHORIZATION_LAPSED` | The authorization stopped covering the route | The authorization was not verified, had expired or did not cover the route at the start of the run or just before the replay, or the spend guard denied the payment with `AUTHORIZATION_INVALID`, `AUTHORIZATION_EXPIRED` or `ORIGIN_NOT_AUTHORIZED` |
+| `INTERNAL_ERROR` | Selo itself failed | An unexpected error or a restart interrupted the run; Selo's wallet could not cover the payment; the spend guard denied with `JOB_NOT_RUNNING`, `NETWORK_NOT_ALLOWED` or `ASSET_NOT_ALLOWED`; Selo failed after your inbound payment settled |
+
+## Why unknown is never PASS
+
+A release gate is only useful if a PASS means something. Selo treats every gap as a reason not to pass:
+
+- **A check that did not run is not a pass.** A missing result makes the verdict INCONCLUSIVE.
+- **A pass without evidence is not a pass.** Every blocking result must point at evidence that Selo recorded during the run.
+- **A failure without evidence is not a failure either.** Selo blocks on it, but reports INCONCLUSIVE rather than claiming a defect it cannot show.
+- **Infrastructure trouble is not your fault.** A timeout, an unreachable catalog or an unresolved payment yields INCONCLUSIVE, never FAIL, because Selo cannot tell whether your endpoint or the network was at fault.
+
+Both FAIL and INCONCLUSIVE block the release. The difference tells you where to look: FAIL points at your endpoint, INCONCLUSIVE at the conditions of the test.
+
+## Internal errors
+
+If something unexpected goes wrong inside Selo during a run, Selo does not drop the job:
+
+1. A payment that was open is held **UNRESOLVED**, so its amount still counts against the budget.
+2. Checks that had started report `INTERNAL_ERROR`; checks that had not started report `NOT_RUN`.
+3. The verdict is reduced with the reason `INTERNAL_ERROR`. A FAIL that was already proven still stands.
+4. The report is written as usual.
+
+When Selo restarts, a sweep concludes every job that was stranded mid-run the same way.
+
+## From verdict to gate
+
+The `selo` CLI does not take the API's verdict on trust. When `selo test` receives a report, it decides the gate in this order:
+
+<Steps>
+  <Step title="Re-derive the verdict">
+    The CLI runs the same reducer on the report's own checks and `inconclusiveReason`. If the result differs from the reported verdict, or the checks cannot be read (for example a check appears twice), it blocks with exit `2`.
+  </Step>
+  <Step title="Block a FAIL">
+    A FAIL blocks with exit `1`, naming every blocking check that failed.
+  </Step>
+  <Step title="Block an INCONCLUSIVE">
+    An INCONCLUSIVE blocks with exit `2`, naming the reason.
+  </Step>
+  <Step title="Require a fully evidenced PASS">
+    A PASS blocks with exit `2` unless the report has a result for all five checks, an inbound settlement transaction id, at least one downstream payment transaction id and a report link.
+  </Step>
+  <Step title="Allow">
+    Only then is the gate `ALLOW`, with exit `0`.
+  </Step>
+</Steps>
+
+| Exit code | Gate | When |
+| --- | --- | --- |
+| `0` | ALLOW | PASS on every release check, fully evidenced |
+| `1` | BLOCK | FAIL proven by a release check |
+| `2` | BLOCK | INCONCLUSIVE, an unconfirmed payment, a missing or inconsistent report, or a transient failure |
+| `3` | BLOCK | Invalid input, authorization missing, preflight ineligible, or payment not approved. Selo refused before anything was paid |
+
+`selo verify` checks a saved [attestation](/concepts/attestations) offline and exits with the attested verdict (`0` for PASS, `1` for FAIL, `2` for INCONCLUSIVE), or `2` when the attestation cannot be verified. See the [CLI overview](/cli/overview) for every case that leads to each exit code, and [Gate deploys in GitHub Actions](/guides/github-actions) to wire the exit code into a workflow.
+
+## Two verdicts from Algorand Mainnet
+
+On 26 October 2026, the demo merchant at `https://demo.useselo.xyz/v1/orders` was tested twice at the same URL.
+
+<Tabs>
+  <Tab title="broken-v1: FAIL">
+    | Check | Status | Code |
+    | --- | --- | --- |
+    | `handshake` | PASS | `HANDSHAKE_VALID` |
+    | `paid_delivery` | PASS | `PAID_AND_DELIVERED` |
+    | `response_contract` | FAIL | `SCHEMA_MISMATCH` |
+    | `discovery_contract` | INCONCLUSIVE | `CATALOG_UNAVAILABLE` |
+    | `retry_safety` | PASS | `PASS_REPLAY_REJECTED` |
+
+    The proven FAIL on `response_contract` wins over the inconclusive discovery check, so the verdict is **FAIL** with `inconclusiveReason: null`. The gate answered `BLOCK`, reason `FAIL: response_contract`, exit `1`.
+  </Tab>
+  <Tab title="fixed-v2: PASS">
+    | Check | Status | Code |
+    | --- | --- | --- |
+    | `handshake` | PASS | `HANDSHAKE_VALID` |
+    | `paid_delivery` | PASS | `PAID_AND_DELIVERED` |
+    | `response_contract` | PASS | `CONTRACT_MATCHED` |
+    | `discovery_contract` | PASS | `DISCOVERY_CONSISTENT` |
+    | `retry_safety` | PASS | `PASS_REPLAY_REJECTED` |
+
+    All five checks passed with evidence and both payment legs are recorded, so the verdict is **PASS**. The gate answered `ALLOW`, reason `PASS on every release check`, exit `0`.
+  </Tab>
+</Tabs>
+
+See [Proof on Algorand Mainnet](/resources/mainnet-proof) for the transactions and the GitHub Actions runs.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="The five release checks" icon="list-check" href="/concepts/checks">
+    Every code each check can report.
+  </Card>
+  <Card title="Signed attestations" icon="signature" href="/concepts/attestations">
+    The verdict, signed with Ed25519 and verifiable offline.
+  </Card>
+  <Card title="CLI overview" icon="terminal" href="/cli/overview">
+    Install, environment and the full exit code reference.
+  </Card>
+  <Card title="Recover an interrupted run" icon="rotate-right" href="/guides/resume">
+    What to do when the gate exits `2` because a payment is unconfirmed.
+  </Card>
+</CardGroup>
