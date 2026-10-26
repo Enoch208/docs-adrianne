@@ -1,0 +1,751 @@
+---
+title: "Objects"
+description: "Field-by-field reference for the release test response, check results, the private report, signed attestations, attestation keys, authorizations and preflights."
+icon: "brackets-curly"
+sidebarTitle: "Objects"
+---
+
+This page describes every object the Selo API returns, field by field. The wire shapes are defined once in Selo's core package and shared by the API, the CLI and the GitHub Action. Examples come from the two Mainnet runs against the demo merchant on 26 October 2026 (`broken-v1` and `fixed-v2`), or use placeholders such as `auth_…` for values that are yours.
+
+## Conventions
+
+- IDs are a prefix plus 26 Crockford base32 characters: `auth_`, `pfl_`, `job_`, `evd_`.
+- USDC amounts are decimal strings with 2 to 6 decimals, such as `"1.00"` or `"0.01"`.
+- Timestamps are ISO 8601 in UTC.
+- Transaction IDs are Algorand transaction IDs. Look one up at `https://allo.info/tx/<txId>`.
+- Fields typed `… | null` are always present and set to `null` when empty.
+
+## Release test response
+
+Returned with `200` by `POST /v1/release-test`. This is the object the CLI and the GitHub Action gate on.
+
+```json Release test response (fixed-v2, attestation omitted)
+{
+  "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+  "verdict": "PASS",
+  "target": "https://demo.useselo.xyz/v1/orders",
+  "checks": [
+    {
+      "id": "handshake",
+      "status": "PASS",
+      "code": "HANDSHAKE_VALID",
+      "blocking": true,
+      "summary": "Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704.",
+      "evidence": ["evd_B23GQN052SFAET2QME89MVYX5G"]
+    },
+    {
+      "id": "paid_delivery",
+      "status": "PASS",
+      "code": "PAID_AND_DELIVERED",
+      "blocking": true,
+      "summary": "Downstream payment settled and target returned 200 with transaction QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ.",
+      "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"]
+    },
+    {
+      "id": "response_contract",
+      "status": "PASS",
+      "code": "CONTRACT_MATCHED",
+      "blocking": true,
+      "summary": "Observed response matched the expected status 200 and content type application/json.",
+      "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW"]
+    },
+    {
+      "id": "discovery_contract",
+      "status": "PASS",
+      "code": "DISCOVERY_CONSISTENT",
+      "blocking": true,
+      "summary": "Live challenge and catalog record agree on method, URL, payment terms and carry usable metadata.",
+      "evidence": ["evd_TE2XZJB33D4CXHV2EMW84SS6BG"]
+    },
+    {
+      "id": "retry_safety",
+      "status": "PASS",
+      "code": "PASS_REPLAY_REJECTED",
+      "blocking": true,
+      "summary": "Replaying the identical signed payment header was rejected with status 402.",
+      "evidence": ["evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R"]
+    }
+  ],
+  "warnings": [],
+  "inconclusiveReason": null,
+  "money": {
+    "seloInboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+    "downstreamSpendUsdc": "0.01",
+    "downstreamTxIds": ["QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"]
+  },
+  "reportUrl": "https://api.useselo.xyz/v1/reports/<report token>"
+}
+```
+
+<ResponseField name="jobId" type="string" required>
+  The release job, `job_` plus 26 characters.
+</ResponseField>
+
+<ResponseField name="verdict" type="string" required>
+  `PASS`, `FAIL` or `INCONCLUSIVE`, decided by deterministic code. Any blocking FAIL with evidence gives FAIL; otherwise any blocking INCONCLUSIVE, missing check, or PASS without evidence gives INCONCLUSIVE; otherwise PASS. See [Verdicts and the gate](/concepts/verdicts).
+</ResponseField>
+
+<ResponseField name="target" type="string" required>
+  The tested URL.
+</ResponseField>
+
+<ResponseField name="checks" type="CheckResult[]" required>
+  All five checks, always in this order: `handshake`, `paid_delivery`, `response_contract`, `discovery_contract`, `retry_safety`. See [Check result](#check-result).
+</ResponseField>
+
+<ResponseField name="warnings" type="string[]" required>
+  One line per WARN check, formatted `<check id>: <summary>`. Empty when nothing warned.
+</ResponseField>
+
+<ResponseField name="inconclusiveReason" type="string | null" required>
+  Why the job is INCONCLUSIVE, or `null` on PASS and FAIL. One of `NETWORK_UNAVAILABLE`, `FACILITATOR_UNAVAILABLE`, `TARGET_TIMEOUT`, `BUDGET_EXHAUSTED`, `PAYMENT_UNRESOLVED`, `EVIDENCE_INCOMPLETE`, `AUTHORIZATION_LAPSED`, `INTERNAL_ERROR`. See [INCONCLUSIVE reasons](/api-reference/errors#inconclusive-reasons).
+</ResponseField>
+
+<ResponseField name="money" type="object" required>
+  Both payment legs of the job.
+
+  <Expandable title="properties">
+    <ResponseField name="seloInboundTxId" type="string" required>
+      Transaction ID of your payment to Selo. Selo paid nothing to the target before this transaction settled.
+    </ResponseField>
+    <ResponseField name="downstreamSpendUsdc" type="string" required>
+      USDC Selo paid the target and saw settle.
+    </ResponseField>
+    <ResponseField name="downstreamTxIds" type="string[]" required>
+      Transaction IDs of Selo's settled payments to the target.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="reportUrl" type="string" required>
+  Private report link, `https://api.useselo.xyz/v1/reports/<token>`. Anyone with the link can read the report, so keep it out of public logs. See [Release report](#release-report).
+</ResponseField>
+
+<ResponseField name="attestation" type="ReleaseAttestation">
+  Ed25519-signed statement of this verdict. Present when the Selo deployment has a signing key, which the public API has. A repeated request returns the same attestation. See [Release attestation](#release-attestation).
+</ResponseField>
+
+## Check result
+
+One entry of `checks` in the release test response and in the report.
+
+```json Check result (broken-v1)
+{
+  "id": "response_contract",
+  "status": "FAIL",
+  "code": "SCHEMA_MISMATCH",
+  "blocking": true,
+  "summary": "Response body did not match the expected schema: must have required property 'receiptId'",
+  "evidence": ["evd_C3YHMHPAX7S53BNXWHAG5H2MA4", "evd_SM1RPAAJH2ZZNMTA11SJK431ZW"]
+}
+```
+
+<ResponseField name="id" type="string" required>
+  `handshake`, `paid_delivery`, `response_contract`, `discovery_contract` or `retry_safety`. See [The five release checks](/concepts/checks).
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  `PASS`, `WARN`, `FAIL` or `INCONCLUSIVE`. See [Check statuses](/api-reference/errors#check-statuses).
+</ResponseField>
+
+<ResponseField name="code" type="string" required>
+  Result code, such as `HANDSHAKE_VALID`, `PAID_AND_DELIVERED`, `SCHEMA_MISMATCH` or `NOT_RUN` (the check did not run). For `retry_safety` it is one of the [retry outcomes](/api-reference/errors#retry-outcomes).
+</ResponseField>
+
+<ResponseField name="blocking" type="boolean" required>
+  Whether the check can decide the verdict. Every check in the `quick` profile is blocking.
+</ResponseField>
+
+<ResponseField name="summary" type="string" required>
+  One sentence describing what Selo observed.
+</ResponseField>
+
+<ResponseField name="evidence" type="string[]" required>
+  IDs (`evd_…`) of the evidence records behind the result. Their hashes are listed in the attestation. A PASS with no evidence counts as INCONCLUSIVE.
+</ResponseField>
+
+## Release report
+
+Returned with `200` by `GET /v1/reports/{token}`. It holds everything in the release test response plus the contract, the observed response, every payment and every scenario. It does not carry the attestation.
+
+```json Release report (fixed-v2, abridged; values in angle brackets are placeholders)
+{
+  "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+  "project": "<project from the authorization>",
+  "target": { "url": "https://demo.useselo.xyz/v1/orders", "method": "POST" },
+  "testedAt": "2026-10-26T10:24:02.883Z",
+  "completedAt": "2026-10-26T10:24:12.218Z",
+  "seloVersion": "71080ad",
+  "verdict": "PASS",
+  "inconclusiveReason": null,
+  "checks": ["<the five check results, as in the release test response>"],
+  "warnings": [],
+  "failureCodes": [],
+  "targetChallengeSha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc",
+  "expected": {
+    "status": 200,
+    "contentType": "application/json",
+    "jsonSchema": {
+      "type": "object",
+      "required": ["orderId", "receiptId", "fulfilled"],
+      "properties": {
+        "orderId": { "type": "string", "pattern": "^ord_[0-9a-f]{24}$" },
+        "receiptId": { "type": "string", "pattern": "^rcpt_[0-9a-f]{24}$" },
+        "fulfilled": { "const": true }
+      }
+    }
+  },
+  "observedResponse": {
+    "status": 200,
+    "contentType": "application/json",
+    "bodySha256": "<sha256 hex of the paid response body>",
+    "bodyBytes": "<body size in bytes>",
+    "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ",
+    "requestedAt": "<ISO 8601 time of the paid request>"
+  },
+  "money": {
+    "inboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+    "downstreamSpendUsdc": "0.01",
+    "unresolvedSpendUsdc": "0.00",
+    "downstreamTxIds": ["QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"],
+    "payments": [
+      {
+        "status": "SETTLED",
+        "amountUsdc": "0.01",
+        "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ",
+        "expectedTxId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"
+      }
+    ]
+  },
+  "scenarios": [
+    {
+      "check": "handshake",
+      "operationId": "job_51AZ2WJZ78RF1WZC316Q1K38GG:handshake",
+      "status": "EVALUATED",
+      "attempts": "<attempt count>",
+      "durationMs": "<milliseconds>",
+      "failureCode": null
+    }
+  ]
+}
+```
+
+<ResponseField name="jobId" type="string" required>
+  The release job.
+</ResponseField>
+
+<ResponseField name="project" type="string" required>
+  The project name given when the authorization was created.
+</ResponseField>
+
+<ResponseField name="target" type="object" required>
+  <Expandable title="properties">
+    <ResponseField name="url" type="string" required>
+      The tested URL.
+    </ResponseField>
+    <ResponseField name="method" type="string" required>
+      `GET` or `POST`, the method Selo used.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="testedAt" type="string | null" required>
+  When the checks started.
+</ResponseField>
+
+<ResponseField name="completedAt" type="string | null" required>
+  When the job finished.
+</ResponseField>
+
+<ResponseField name="seloVersion" type="string" required>
+  Git commit of the Selo build that ran the job, or `unknown`.
+</ResponseField>
+
+<ResponseField name="verdict" type="string | null" required>
+  `PASS`, `FAIL` or `INCONCLUSIVE`. A served report always has a verdict.
+</ResponseField>
+
+<ResponseField name="inconclusiveReason" type="string | null" required>
+  As in the release test response.
+</ResponseField>
+
+<ResponseField name="checks" type="CheckResult[]" required>
+  The five check results, in fixed order. See [Check result](#check-result).
+</ResponseField>
+
+<ResponseField name="warnings" type="string[]" required>
+  As in the release test response.
+</ResponseField>
+
+<ResponseField name="failureCodes" type="string[]" required>
+  The `code` of every check that is FAIL or INCONCLUSIVE. For `broken-v1` this is `["SCHEMA_MISMATCH", "CATALOG_UNAVAILABLE"]`.
+</ResponseField>
+
+<ResponseField name="targetChallengeSha256" type="string | null" required>
+  SHA-256 of the target's 402 challenge as Selo recorded it. The same value is signed in the attestation.
+</ResponseField>
+
+<ResponseField name="expected" type="object | null" required>
+  The release contract you sent, or `null` when you sent none (Selo then checks only for status `200`).
+
+  <Expandable title="properties">
+    <ResponseField name="status" type="integer">
+      Expected HTTP status, 100 to 599. Defaults to `200` when omitted.
+    </ResponseField>
+    <ResponseField name="contentType" type="string">
+      Expected media type, `type/subtype`, compared case-insensitively. At most 200 characters.
+    </ResponseField>
+    <ResponseField name="jsonSchema" type="object">
+      JSON Schema the paid body must satisfy, compiled with Ajv 8 in strict mode. At most 16 KiB serialized.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="observedResponse" type="object | null" required>
+  Metadata of the paid response. The body itself is never returned.
+
+  <Expandable title="properties">
+    <ResponseField name="status" type="integer" required>
+      HTTP status of the paid response.
+    </ResponseField>
+    <ResponseField name="contentType" type="string | null" required>
+      Its `Content-Type`.
+    </ResponseField>
+    <ResponseField name="bodySha256" type="string | null" required>
+      SHA-256 hex of the body.
+    </ResponseField>
+    <ResponseField name="bodyBytes" type="integer | null" required>
+      Body size in bytes.
+    </ResponseField>
+    <ResponseField name="txId" type="string | null" required>
+      Settlement transaction the target reported in its `PAYMENT-RESPONSE` and Selo accepted.
+    </ResponseField>
+    <ResponseField name="requestedAt" type="string | null" required>
+      When Selo sent the paid request.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="money" type="object" required>
+  <Expandable title="properties">
+    <ResponseField name="inboundTxId" type="string | null" required>
+      Transaction ID of your payment to Selo.
+    </ResponseField>
+    <ResponseField name="downstreamSpendUsdc" type="string" required>
+      USDC paid to the target and settled.
+    </ResponseField>
+    <ResponseField name="unresolvedSpendUsdc" type="string" required>
+      USDC held because a payment outcome is unknown. See [Held payments and reconciliation](/concepts/reconciliation).
+    </ResponseField>
+    <ResponseField name="downstreamTxIds" type="string[]" required>
+      Settled transaction IDs to the target.
+    </ResponseField>
+    <ResponseField name="payments" type="object[]" required>
+      Every downstream payment of the job.
+
+      <Expandable title="properties">
+        <ResponseField name="status" type="string" required>
+          `RESERVED`: budget held before signing. `SETTLED`: confirmed. `RELEASED`: definitely not paid, budget returned. `UNRESOLVED`: outcome unknown, amount held.
+        </ResponseField>
+        <ResponseField name="amountUsdc" type="string" required>
+          Amount of the payment.
+        </ResponseField>
+        <ResponseField name="txId" type="string | null" required>
+          Settled transaction ID.
+        </ResponseField>
+        <ResponseField name="expectedTxId" type="string | null" required>
+          ID of the transaction Selo signed, recorded before sending. Used to reconcile an unresolved payment on chain.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="scenarios" type="object[]" required>
+  One scenario per check that was planned, in check order.
+
+  <Expandable title="properties">
+    <ResponseField name="check" type="string" required>
+      The check ID.
+    </ResponseField>
+    <ResponseField name="operationId" type="string" required>
+      Immutable operation ID, `<jobId>:<check id>`. Requests to the target carry their scenario's operation ID as `Idempotency-Key`; the replay reuses the paid request's.
+    </ResponseField>
+    <ResponseField name="status" type="string" required>
+      Final scenario state: `PLANNED`, `POLICY_CHECKED`, `RESERVED`, `REQUESTING`, `SETTLED`, `REJECTED`, `TIMEOUT_UNRESOLVED` or `EVALUATED`.
+    </ResponseField>
+    <ResponseField name="attempts" type="integer" required>
+      Attempts recorded for this scenario.
+    </ResponseField>
+    <ResponseField name="durationMs" type="integer | null" required>
+      Time from the scenario's first step to its evaluation.
+    </ResponseField>
+    <ResponseField name="failureCode" type="string | null" required>
+      The check's `code` when it did not PASS, otherwise `null`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Release attestation
+
+The `attestation` field of the release test response: an Ed25519 signature over a statement of the verdict. Verify it offline with the [attestation keys](#attestation-key-set). See [Signed attestations](/concepts/attestations) and [Verify a signed verdict](/guides/verify-attestation).
+
+```json Release attestation (fixed-v2)
+{
+  "payload": {
+    "schemaVersion": "selo.release.v1",
+    "issuer": "https://api.useselo.xyz",
+    "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+    "testedTarget": { "url": "https://demo.useselo.xyz/v1/orders", "method": "POST" },
+    "deployment": { "id": "fixed-v2", "verification": "asserted_by_client" },
+    "testedAt": "2026-10-26T10:24:02.883Z",
+    "completedAt": "2026-10-26T10:24:12.218Z",
+    "seloVersion": "71080ad",
+    "verdict": "PASS",
+    "inconclusiveReason": null,
+    "checks": [
+      { "id": "handshake", "status": "PASS", "code": "HANDSHAKE_VALID", "blocking": true, "evidence": ["evd_B23GQN052SFAET2QME89MVYX5G"] },
+      { "id": "paid_delivery", "status": "PASS", "code": "PAID_AND_DELIVERED", "blocking": true, "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"] },
+      { "id": "response_contract", "status": "PASS", "code": "CONTRACT_MATCHED", "blocking": true, "evidence": ["evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW"] },
+      { "id": "discovery_contract", "status": "PASS", "code": "DISCOVERY_CONSISTENT", "blocking": true, "evidence": ["evd_TE2XZJB33D4CXHV2EMW84SS6BG"] },
+      { "id": "retry_safety", "status": "PASS", "code": "PASS_REPLAY_REJECTED", "blocking": true, "evidence": ["evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R"] }
+    ],
+    "expectedContractSha256": "6e5b149b1088d214be6a1c097e2e06bf1127fe529c544731023abea7b03e7170",
+    "targetChallengeSha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc",
+    "payments": {
+      "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+      "asset": "31566704",
+      "inboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+      "inboundAmountUsdc": "1.00",
+      "downstream": [
+        { "status": "SETTLED", "amountUsdc": "0.01", "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ" }
+      ]
+    },
+    "evidenceSha256": "49d787f15e7001a408f495aa59f4b16214dca58838e9e99ddd4790f6d6565a96",
+    "evidence": [
+      { "id": "evd_6K2ASNC2G3JG43Q0XE0MSXJATM", "kind": "paid_response", "sha256": "7815cd18d10df182be8f325d6d7a3b67800060da3efeff5c9c01fd409794398b" },
+      { "id": "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R", "kind": "replay_response", "sha256": "a72223caf72ed2bd2d24114062b7cb15655f0d0e9c8cd4442a3bac9e791cae85" },
+      { "id": "evd_B23GQN052SFAET2QME89MVYX5G", "kind": "target_challenge", "sha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc" },
+      { "id": "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW", "kind": "response_contract", "sha256": "f3f8cef64a663df7d7c192ff542878b6653df048b227305e50457bab0fab4bd0" },
+      { "id": "evd_MVWEZKMTNT45MWX6RDA8G6HRQ0", "kind": "authorization_snapshot", "sha256": "207c2d476ea56e68e5bb88fa34ac5a943912be83251088a30f93f99c515626da" },
+      { "id": "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4", "kind": "downstream_payment", "sha256": "cca974ffefb3a23f9528745f1c205e58fc5687e8ef18a0bab527f110fedf609e" },
+      { "id": "evd_SXXV98XNSNVMPPPF7R7YR2RSC8", "kind": "authorization_snapshot", "sha256": "208afc651b36a13f9b93c2decb89cc70558559c709d67ca83606ae65bb2f54e1" },
+      { "id": "evd_TE2XZJB33D4CXHV2EMW84SS6BG", "kind": "catalog_record", "sha256": "4503636c21768df0807c0dfd88ba1813a9f2fdf9629bdf59fce723ed21e25712" }
+    ]
+  },
+  "signature": {
+    "algorithm": "Ed25519",
+    "keyId": "selo-ed25519-728fcf85650b128f",
+    "value": "E3lC29kTmj4Ts8SVoEDFabdAGGAO7ZZs4n9p2P7HUWGePMfi4aO75xQ-v7cynT1T4nT6mB2iQZYAzXe2YIbeBg"
+  }
+}
+```
+
+<ResponseField name="payload" type="object" required>
+  The signed statement. It holds no secret, no request or response body and no report token.
+
+  <Expandable title="properties">
+    <ResponseField name="schemaVersion" type="string" required>
+      Attestation format version, `selo.release.v1`.
+    </ResponseField>
+    <ResponseField name="issuer" type="string" required>
+      Origin of the Selo deployment that signed, `https://api.useselo.xyz`.
+    </ResponseField>
+    <ResponseField name="jobId" type="string" required>
+      The release job.
+    </ResponseField>
+    <ResponseField name="testedTarget" type="object" required>
+      `url` and `method` that were tested.
+    </ResponseField>
+    <ResponseField name="deployment" type="object | null" required>
+      `{ "id": "<deploymentId>", "verification": "asserted_by_client" }` when you sent a `deploymentId`, otherwise `null`. Selo records the ID; it does not verify it.
+    </ResponseField>
+    <ResponseField name="testedAt" type="string | null" required>
+      When the checks started.
+    </ResponseField>
+    <ResponseField name="completedAt" type="string" required>
+      When the job finished.
+    </ResponseField>
+    <ResponseField name="seloVersion" type="string" required>
+      Git commit of the Selo build, or `unknown`.
+    </ResponseField>
+    <ResponseField name="verdict" type="string" required>
+      `PASS`, `FAIL` or `INCONCLUSIVE`.
+    </ResponseField>
+    <ResponseField name="inconclusiveReason" type="string | null" required>
+      As in the release test response.
+    </ResponseField>
+    <ResponseField name="checks" type="object[]" required>
+      Each check's `id`, `status`, `code`, `blocking` and `evidence`, without the summary.
+    </ResponseField>
+    <ResponseField name="expectedContractSha256" type="string | null" required>
+      SHA-256 of the canonical JSON of your `expected` contract, or `null` when you sent none. Compare it with the hash of your own contract file.
+    </ResponseField>
+    <ResponseField name="targetChallengeSha256" type="string | null" required>
+      SHA-256 of the target's 402 challenge Selo recorded.
+    </ResponseField>
+    <ResponseField name="payments" type="object" required>
+      Both payment legs.
+
+      <Expandable title="properties">
+        <ResponseField name="network" type="string" required>
+          CAIP-2 network ID.
+        </ResponseField>
+        <ResponseField name="asset" type="string" required>
+          USDC asset ID, `31566704` on Mainnet.
+        </ResponseField>
+        <ResponseField name="inboundTxId" type="string | null" required>
+          Your payment to Selo.
+        </ResponseField>
+        <ResponseField name="inboundAmountUsdc" type="string | null" required>
+          Amount of your payment.
+        </ResponseField>
+        <ResponseField name="downstream" type="object[]" required>
+          Each payment to the target: `status`, `amountUsdc`, `txId`.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="evidenceSha256" type="string" required>
+      SHA-256 of the canonical JSON of the `evidence` array.
+    </ResponseField>
+    <ResponseField name="evidence" type="object[]" required>
+      Every evidence record of the job, sorted by ID: `id`, `kind` and `sha256` of the sanitized record.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="signature" type="object" required>
+  <Expandable title="properties">
+    <ResponseField name="algorithm" type="string" required>
+      Always `Ed25519`.
+    </ResponseField>
+    <ResponseField name="keyId" type="string" required>
+      The key that signed. Match it to a `keyId` in the attestation key set.
+    </ResponseField>
+    <ResponseField name="value" type="string" required>
+      Ed25519 signature over the UTF-8 bytes of the payload's canonical JSON, base64url without padding.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+**Canonical JSON** is `JSON.stringify` of the payload with object keys sorted at every level and no whitespace. Array order is kept.
+
+The evidence `kind` values:
+
+| Kind | Recorded when |
+| --- | --- |
+| `authorization_snapshot` | The authorization is re-checked at the start of the job and before the replay |
+| `target_challenge` | Selo reads the target's 402 challenge |
+| `paid_response` | The target answers the paid request |
+| `downstream_payment` | Selo's payment to the target is decided: settled, held, released or denied |
+| `response_contract` | The paid response is compared with the release contract |
+| `catalog_record` | Selo looks up the target in the Bazaar catalog |
+| `replay_response` | The target answers the replay of the identical signed payment |
+
+## Attestation key set
+
+Returned by `GET /.well-known/selo-attestation-keys.json`, with `Cache-Control: public, max-age=300`.
+
+```json Attestation key set (live)
+{
+  "keys": [
+    {
+      "keyId": "selo-ed25519-728fcf85650b128f",
+      "algorithm": "Ed25519",
+      "publicKey": "IiUpeUTzfsbOg5-hV6i3eLnqU4uJ7hog31HmgXoc0ZQ"
+    }
+  ]
+}
+```
+
+<ResponseField name="keys" type="object[]" required>
+  Every key the deployment signs with. Empty when it has no signing key.
+
+  <Expandable title="properties">
+    <ResponseField name="keyId" type="string" required>
+      `selo-ed25519-` plus the first 16 hex characters of the SHA-256 of the raw public key.
+    </ResponseField>
+    <ResponseField name="algorithm" type="string" required>
+      Always `Ed25519`.
+    </ResponseField>
+    <ResponseField name="publicKey" type="string" required>
+      The raw 32-byte Ed25519 public key, base64url without padding (the JWK `x` value).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<Tip>
+Pin the key you trust instead of fetching the key set at verification time. The CLI's `selo verify` checks a signature against pinned keys; see [selo verify](/cli/verify).
+</Tip>
+
+## Authorization challenge
+
+Returned with `201` by `POST /v1/authorizations`.
+
+```json Authorization challenge
+{
+  "authorizationId": "auth_…",
+  "status": "PENDING",
+  "origin": "https://api.example.com",
+  "routePath": "/v1/orders",
+  "method": "POST",
+  "verificationUrl": "https://api.example.com/.well-known/selo-verification.txt",
+  "expectedContent": "selo-verification=<token>"
+}
+```
+
+<ResponseField name="authorizationId" type="string" required>
+  `auth_` plus 26 characters.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  `PENDING` for a new authorization.
+</ResponseField>
+
+<ResponseField name="origin" type="string" required>
+  Origin of the target URL.
+</ResponseField>
+
+<ResponseField name="routePath" type="string" required>
+  Path of the target URL, without query string. The authorization covers exactly this path.
+</ResponseField>
+
+<ResponseField name="method" type="string" required>
+  `GET` or `POST`, the method the authorization covers.
+</ResponseField>
+
+<ResponseField name="verificationUrl" type="string" required>
+  Where Selo looks for the token: `<origin>/.well-known/selo-verification.txt`.
+</ResponseField>
+
+<ResponseField name="expectedContent" type="string" required>
+  The exact line to put in that file: `selo-verification=` followed by a 43-character token. Selo keeps only the token's SHA-256, so this is the only time you see it. The challenge stays open for one hour.
+</ResponseField>
+
+## Authorization
+
+Returned by `POST /v1/authorizations/{authorizationId}/verify` and `GET /v1/authorizations/{authorizationId}`.
+
+```json Authorization
+{
+  "authorizationId": "auth_…",
+  "status": "VERIFIED",
+  "origin": "https://api.example.com",
+  "routePath": "/v1/orders",
+  "method": "POST",
+  "type": "well_known_file",
+  "verifiedAt": "2026-10-26T12:00:00.000Z",
+  "expiresAt": "2026-10-27T12:00:00.000Z"
+}
+```
+
+<ResponseField name="authorizationId" type="string" required>
+  The authorization.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  `PENDING`: waiting for verification. `VERIFIED`: Selo may test the target until `expiresAt`. `EXPIRED`: the challenge or the authorization lapsed; reading it is what records the change. `REVOKED`: withdrawn.
+</ResponseField>
+
+<ResponseField name="origin" type="string" required>
+  Authorized origin.
+</ResponseField>
+
+<ResponseField name="routePath" type="string" required>
+  Authorized path.
+</ResponseField>
+
+<ResponseField name="method" type="string" required>
+  `GET` or `POST`, the authorized method.
+</ResponseField>
+
+<ResponseField name="type" type="string" required>
+  `well_known_file`: verified through the well-known file. `manual_owner_consent`: an explicit owner consent recorded by the Selo operator.
+</ResponseField>
+
+<ResponseField name="verifiedAt" type="string | null" required>
+  When Selo verified the token, or `null` while pending.
+</ResponseField>
+
+<ResponseField name="expiresAt" type="string" required>
+  While `PENDING`, when the challenge closes (one hour after creation). Once `VERIFIED`, when the authorization lapses (24 hours after verification).
+</ResponseField>
+
+## Preflight responses
+
+`POST /v1/preflight` and `GET /v1/preflight/{preflightId}` return one of two shapes. Branch on `eligible`.
+
+<Tabs>
+  <Tab title="Eligible">
+    Returned with `201` by `POST /v1/preflight`, and with `200` by `GET`.
+
+    ```json Eligible preflight
+    {
+      "eligible": true,
+      "preflightId": "pfl_…",
+      "target": {
+        "url": "https://api.example.com/v1/orders",
+        "method": "POST",
+        "priceUsdc": "0.01"
+      },
+      "estimatedMaxSpendUsdc": "0.01",
+      "seloPriceUsdc": "1.00",
+      "expiresAt": "2026-10-26T12:15:00.000Z"
+    }
+    ```
+
+    <ResponseField name="eligible" type="boolean" required>
+      Always `true` for this shape. The target can be tested.
+    </ResponseField>
+    <ResponseField name="preflightId" type="string" required>
+      `pfl_` plus 26 characters. Pass it to `POST /v1/release-test`.
+    </ResponseField>
+    <ResponseField name="target" type="object" required>
+      <Expandable title="properties">
+        <ResponseField name="url" type="string" required>
+          The target URL, without fragment.
+        </ResponseField>
+        <ResponseField name="method" type="string" required>
+          `GET` or `POST`.
+        </ResponseField>
+        <ResponseField name="priceUsdc" type="string" required>
+          Price the target asked for in its 402 challenge.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="estimatedMaxSpendUsdc" type="string" required>
+      What Selo expects to pay the target: one paid request at its price.
+    </ResponseField>
+    <ResponseField name="seloPriceUsdc" type="string" required>
+      What the release test costs you.
+    </ResponseField>
+    <ResponseField name="expiresAt" type="string" required>
+      Fifteen minutes after the preflight. `GET` does not re-evaluate it, so compare this with the current time before paying.
+    </ResponseField>
+  </Tab>
+  <Tab title="Ineligible">
+    Returned by `POST /v1/preflight` with `400`, `403` or `422` depending on the reason, and with `200` by `GET`.
+
+    ```json Ineligible preflight
+    {
+      "eligible": false,
+      "preflightId": "pfl_…",
+      "reason": "NO_PAYMENT_CHALLENGE",
+      "message": "The target did not answer the unpaid request with a valid x402 challenge"
+    }
+    ```
+
+    <ResponseField name="eligible" type="boolean" required>
+      Always `false` for this shape. The target cannot be tested. Nothing was paid.
+    </ResponseField>
+    <ResponseField name="preflightId" type="string | null" required>
+      The stored preflight, or `null` when Selo refused the request before storing it: an invalid or non-https URL, a blocked hostname, or an unknown authorization ID.
+    </ResponseField>
+    <ResponseField name="reason" type="string" required>
+      One of the [preflight rejection reasons](/api-reference/errors#preflight-rejection-reasons).
+    </ResponseField>
+    <ResponseField name="message" type="string" required>
+      Human-readable explanation of the reason.
+    </ResponseField>
+  </Tab>
+</Tabs>

@@ -1,0 +1,3765 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Selo API",
+    "version": "1.0.0",
+    "summary": "CI for x402. It pays your endpoint before your users do.",
+    "description": "Selo is a release gate for paid x402 APIs on Algorand. You authorize your endpoint, run a free preflight, then pay Selo 1.00 USDC over x402. Only after that payment settles does Selo pay your endpoint as a real x402 client, run five release checks and return a deterministic PASS, FAIL or INCONCLUSIVE verdict with an Ed25519-signed attestation.\n\nThere are no API keys. Access to a target is granted per target by authorization; the only paid route is `POST /v1/release-test`, paid with x402. Bodies are JSON, at most 64 KiB.",
+    "contact": {
+      "name": "Selo",
+      "url": "https://useselo.xyz"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://api.useselo.xyz",
+      "description": "Production, Algorand Mainnet"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Authorizations",
+      "description": "Prove you control the target before Selo sends it anything."
+    },
+    {
+      "name": "Preflight",
+      "description": "Check for free that a target can be tested and is within budget."
+    },
+    {
+      "name": "Release tests",
+      "description": "The paid x402 route that runs the release checks."
+    },
+    {
+      "name": "Reports",
+      "description": "Private, token-addressed reports of finished release tests."
+    },
+    {
+      "name": "Attestation keys",
+      "description": "Public keys that verify signed verdicts."
+    },
+    {
+      "name": "Discovery",
+      "description": "Machine-readable descriptions of Selo."
+    },
+    {
+      "name": "Health",
+      "description": "Liveness."
+    }
+  ],
+  "security": [],
+  "paths": {
+    "/v1/authorizations": {
+      "post": {
+        "tags": [
+          "Authorizations"
+        ],
+        "operationId": "createAuthorization",
+        "summary": "Create an authorization",
+        "description": "Start proving that you control a target. Selo returns a one-time token; serve it as a line in `<origin>/.well-known/selo-verification.txt`, then call the verify endpoint. The authorization covers exactly one origin, path and method. The challenge stays open for one hour. This call is free and contacts nothing: Selo only parses the URL here.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAuthorizationRequest"
+              },
+              "example": {
+                "targetUrl": "https://api.example.com/v1/orders",
+                "method": "POST",
+                "project": "orders-api",
+                "contact": "dev@example.com"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Authorization created in `PENDING` state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizationChallenge"
+                },
+                "examples": {
+                  "created": {
+                    "summary": "Challenge to publish",
+                    "value": {
+                      "authorizationId": "auth_…",
+                      "status": "PENDING",
+                      "origin": "https://api.example.com",
+                      "routePath": "/v1/orders",
+                      "method": "POST",
+                      "verificationUrl": "https://api.example.com/.well-known/selo-verification.txt",
+                      "expectedContent": "selo-verification=<token>"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not valid JSON, fails validation, or the target URL is refused.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "VALIDATION_FAILED": {
+                    "summary": "Missing field",
+                    "value": {
+                      "error": "VALIDATION_FAILED",
+                      "message": "✖ Invalid input: expected string, received undefined\n  → at contact"
+                    }
+                  },
+                  "INVALID_JSON": {
+                    "summary": "Body is not JSON",
+                    "value": {
+                      "error": "VALIDATION_FAILED",
+                      "message": "Request body must be valid JSON"
+                    }
+                  },
+                  "TARGET_URL_INVALID": {
+                    "summary": "Not an absolute URL",
+                    "value": {
+                      "error": "TARGET_URL_INVALID",
+                      "message": "The target URL is not a valid absolute URL"
+                    }
+                  },
+                  "TARGET_NOT_HTTPS": {
+                    "summary": "Not https",
+                    "value": {
+                      "error": "TARGET_NOT_HTTPS",
+                      "message": "Only https targets can be authorized"
+                    }
+                  },
+                  "TARGET_ADDRESS_BLOCKED": {
+                    "summary": "IP literal, private name or custom port",
+                    "value": {
+                      "error": "TARGET_ADDRESS_BLOCKED",
+                      "message": "The target must be a public hostname on the default https port"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/authorizations/{authorizationId}/verify": {
+      "post": {
+        "tags": [
+          "Authorizations"
+        ],
+        "operationId": "verifyAuthorization",
+        "summary": "Verify an authorization",
+        "description": "Selo fetches `<origin>/.well-known/selo-verification.txt` with `GET` (10 second timeout, at most 4096 bytes, redirects followed only within the same origin, at most 3) and looks for a line equal to `expectedContent`. On success the authorization becomes `VERIFIED` for 24 hours. Calling it again on a verified authorization returns it unchanged without fetching. No request body.",
+        "parameters": [
+          {
+            "name": "authorizationId",
+            "in": "path",
+            "required": true,
+            "description": "Authorization ID returned by `POST /v1/authorizations`. A value that is not a well-formed ID returns 404.",
+            "schema": {
+              "type": "string",
+              "pattern": "^auth_[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "example": "auth_…"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The authorization is verified.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Authorization"
+                },
+                "examples": {
+                  "verified": {
+                    "summary": "Verified",
+                    "value": {
+                      "authorizationId": "auth_…",
+                      "status": "VERIFIED",
+                      "origin": "https://api.example.com",
+                      "routePath": "/v1/orders",
+                      "method": "POST",
+                      "type": "well_known_file",
+                      "verifiedAt": "2026-10-26T12:00:00.000Z",
+                      "expiresAt": "2026-10-27T12:00:00.000Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No authorization with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "NOT_FOUND": {
+                    "summary": "Unknown ID",
+                    "value": {
+                      "error": "NOT_FOUND",
+                      "message": "Authorization auth_… does not exist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The token was not found, or the authorization can no longer be verified.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "VERIFICATION_FAILED": {
+                    "summary": "Token missing",
+                    "value": {
+                      "error": "VERIFICATION_FAILED",
+                      "message": "https://api.example.com/.well-known/selo-verification.txt does not contain the expected selo-verification line"
+                    }
+                  },
+                  "CHALLENGE_EXPIRED": {
+                    "summary": "Challenge older than one hour",
+                    "value": {
+                      "error": "CHALLENGE_EXPIRED",
+                      "message": "The verification challenge expired; create a new one"
+                    }
+                  },
+                  "AUTHORIZATION_EXPIRED": {
+                    "summary": "Verified authorization lapsed",
+                    "value": {
+                      "error": "AUTHORIZATION_EXPIRED",
+                      "message": "The authorization expired; create a new one"
+                    }
+                  },
+                  "AUTHORIZATION_REVOKED": {
+                    "summary": "Revoked",
+                    "value": {
+                      "error": "AUTHORIZATION_REVOKED",
+                      "message": "Authorization auth_… was revoked"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Selo refused to fetch the verification file. `error` is the block reason: `TARGET_URL_INVALID`, `TARGET_NOT_HTTPS`, `TARGET_ADDRESS_BLOCKED` (the name resolves to a non-public address), `ORIGIN_NOT_ALLOWED` (a redirect left the origin) or `TOO_MANY_REDIRECTS`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "TARGET_ADDRESS_BLOCKED": {
+                    "summary": "Resolves to a private address",
+                    "value": {
+                      "error": "TARGET_ADDRESS_BLOCKED",
+                      "message": "Selo refused to fetch https://api.example.com/.well-known/selo-verification.txt"
+                    }
+                  },
+                  "ORIGIN_NOT_ALLOWED": {
+                    "summary": "Redirect to another origin",
+                    "value": {
+                      "error": "ORIGIN_NOT_ALLOWED",
+                      "message": "Selo refused to fetch https://api.example.com/.well-known/selo-verification.txt"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "502": {
+            "description": "The verification file could not be fetched (timeout or network error).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "VERIFICATION_UNREACHABLE": {
+                    "summary": "Unreachable",
+                    "value": {
+                      "error": "VERIFICATION_UNREACHABLE",
+                      "message": "Could not reach https://api.example.com/.well-known/selo-verification.txt"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/authorizations/{authorizationId}": {
+      "get": {
+        "tags": [
+          "Authorizations"
+        ],
+        "operationId": "getAuthorization",
+        "summary": "Get an authorization",
+        "description": "Read the current state of an authorization. A `PENDING` or `VERIFIED` authorization past `expiresAt` is moved to `EXPIRED` by this read.",
+        "parameters": [
+          {
+            "name": "authorizationId",
+            "in": "path",
+            "required": true,
+            "description": "Authorization ID returned by `POST /v1/authorizations`. A value that is not a well-formed ID returns 404.",
+            "schema": {
+              "type": "string",
+              "pattern": "^auth_[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "example": "auth_…"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The authorization.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Authorization"
+                },
+                "examples": {
+                  "verified": {
+                    "summary": "Verified",
+                    "value": {
+                      "authorizationId": "auth_…",
+                      "status": "VERIFIED",
+                      "origin": "https://api.example.com",
+                      "routePath": "/v1/orders",
+                      "method": "POST",
+                      "type": "well_known_file",
+                      "verifiedAt": "2026-10-26T12:00:00.000Z",
+                      "expiresAt": "2026-10-27T12:00:00.000Z"
+                    }
+                  },
+                  "pending": {
+                    "summary": "Waiting for verification",
+                    "value": {
+                      "authorizationId": "auth_…",
+                      "status": "PENDING",
+                      "origin": "https://api.example.com",
+                      "routePath": "/v1/orders",
+                      "method": "POST",
+                      "type": "well_known_file",
+                      "verifiedAt": null,
+                      "expiresAt": "2026-10-26T13:00:00.000Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No authorization with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "NOT_FOUND": {
+                    "summary": "Unknown ID",
+                    "value": {
+                      "error": "NOT_FOUND",
+                      "message": "Authorization auth_… does not exist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/preflight": {
+      "post": {
+        "tags": [
+          "Preflight"
+        ],
+        "operationId": "createPreflight",
+        "summary": "Run a preflight",
+        "description": "Check, for free, that a target can be tested before you pay. Selo checks the authorization, sends one unpaid request to the target (with `requestBody` for `POST`, 10 second timeout, redirects not followed), reads its x402 v2 challenge, and requires an `exact` USDC payment on Algorand priced at or below the per-job spend limit (0.50 USDC). It also looks the target up in the Bazaar catalog and stores what it finds with the preflight. An eligible preflight is valid for 15 minutes.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreflightRequest"
+              },
+              "examples": {
+                "post": {
+                  "summary": "POST route with a body",
+                  "value": {
+                    "authorizationId": "auth_…",
+                    "targetUrl": "https://api.example.com/v1/orders",
+                    "method": "POST",
+                    "requestBody": {
+                      "sku": "demo-widget",
+                      "quantity": 1
+                    }
+                  }
+                },
+                "get": {
+                  "summary": "GET route",
+                  "value": {
+                    "authorizationId": "auth_…",
+                    "targetUrl": "https://api.example.com/v1/quote",
+                    "method": "GET"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The target is eligible.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreflightEligible"
+                },
+                "examples": {
+                  "eligible": {
+                    "summary": "Eligible",
+                    "value": {
+                      "eligible": true,
+                      "preflightId": "pfl_…",
+                      "target": {
+                        "url": "https://api.example.com/v1/orders",
+                        "method": "POST",
+                        "priceUsdc": "0.01"
+                      },
+                      "estimatedMaxSpendUsdc": "0.01",
+                      "seloPriceUsdc": "1.00",
+                      "expiresAt": "2026-10-26T12:15:00.000Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body fails validation (`ApiError`), or the target URL is invalid or not https (`PreflightIneligible`, `preflightId` is `null`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/PreflightIneligible"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApiError"
+                    }
+                  ]
+                },
+                "examples": {
+                  "TARGET_URL_INVALID": {
+                    "summary": "TARGET_URL_INVALID",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": null,
+                      "reason": "TARGET_URL_INVALID",
+                      "message": "The target URL is not a valid absolute URL"
+                    }
+                  },
+                  "TARGET_NOT_HTTPS": {
+                    "summary": "TARGET_NOT_HTTPS",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": null,
+                      "reason": "TARGET_NOT_HTTPS",
+                      "message": "Only https targets can be tested"
+                    }
+                  },
+                  "VALIDATION_FAILED": {
+                    "summary": "Body on a GET",
+                    "value": {
+                      "error": "VALIDATION_FAILED",
+                      "message": "✖ requestBody is only allowed with POST\n  → at requestBody"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "No verified, unexpired authorization covers this origin, path and method. `preflightId` is `null` when the authorization ID is unknown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreflightIneligible"
+                },
+                "examples": {
+                  "AUTHORIZATION_MISSING": {
+                    "summary": "AUTHORIZATION_MISSING",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "AUTHORIZATION_MISSING",
+                      "message": "No verified authorization covers this target origin, route and method"
+                    }
+                  },
+                  "AUTHORIZATION_EXPIRED": {
+                    "summary": "AUTHORIZATION_EXPIRED",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "AUTHORIZATION_EXPIRED",
+                      "message": "The authorization is not verified or has expired; verify it again"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "description": "The target cannot be tested. Probe rejections carry a stored `preflightId`; a blocked hostname found while parsing the URL has `preflightId: null`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreflightIneligible"
+                },
+                "examples": {
+                  "TARGET_ADDRESS_BLOCKED": {
+                    "summary": "TARGET_ADDRESS_BLOCKED",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "TARGET_ADDRESS_BLOCKED",
+                      "message": "The target must be a public hostname on the default https port"
+                    }
+                  },
+                  "TARGET_UNREACHABLE": {
+                    "summary": "TARGET_UNREACHABLE",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "TARGET_UNREACHABLE",
+                      "message": "The target could not be reached or answered with a server error"
+                    }
+                  },
+                  "NO_PAYMENT_CHALLENGE": {
+                    "summary": "NO_PAYMENT_CHALLENGE",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "NO_PAYMENT_CHALLENGE",
+                      "message": "The target did not answer the unpaid request with a valid x402 challenge"
+                    }
+                  },
+                  "NETWORK_NOT_SUPPORTED": {
+                    "summary": "NETWORK_NOT_SUPPORTED",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "NETWORK_NOT_SUPPORTED",
+                      "message": "The target offers no exact payment on the Algorand network Selo pays on"
+                    }
+                  },
+                  "ASSET_NOT_SUPPORTED": {
+                    "summary": "ASSET_NOT_SUPPORTED",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "ASSET_NOT_SUPPORTED",
+                      "message": "The target offers no exact payment in USDC on the Algorand network"
+                    }
+                  },
+                  "PRICE_OVER_BUDGET": {
+                    "summary": "PRICE_OVER_BUDGET",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "PRICE_OVER_BUDGET",
+                      "message": "The target price exceeds the per-job downstream spend limit"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/preflight/{preflightId}": {
+      "get": {
+        "tags": [
+          "Preflight"
+        ],
+        "operationId": "getPreflight",
+        "summary": "Get a preflight",
+        "description": "Read a stored preflight, eligible or not, with status 200. The response is not re-evaluated: compare `expiresAt` with the current time before paying.",
+        "parameters": [
+          {
+            "name": "preflightId",
+            "in": "path",
+            "required": true,
+            "description": "Preflight ID returned by `POST /v1/preflight`. A value that is not a well-formed ID returns 404.",
+            "schema": {
+              "type": "string",
+              "pattern": "^pfl_[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "example": "pfl_…"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored preflight.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreflightResponse"
+                },
+                "examples": {
+                  "eligible": {
+                    "summary": "Eligible",
+                    "value": {
+                      "eligible": true,
+                      "preflightId": "pfl_…",
+                      "target": {
+                        "url": "https://api.example.com/v1/orders",
+                        "method": "POST",
+                        "priceUsdc": "0.01"
+                      },
+                      "estimatedMaxSpendUsdc": "0.01",
+                      "seloPriceUsdc": "1.00",
+                      "expiresAt": "2026-10-26T12:15:00.000Z"
+                    }
+                  },
+                  "ineligible": {
+                    "summary": "NO_PAYMENT_CHALLENGE",
+                    "value": {
+                      "eligible": false,
+                      "preflightId": "pfl_…",
+                      "reason": "NO_PAYMENT_CHALLENGE",
+                      "message": "The target did not answer the unpaid request with a valid x402 challenge"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No preflight with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "NOT_FOUND": {
+                    "summary": "Unknown ID",
+                    "value": {
+                      "error": "NOT_FOUND",
+                      "message": "Preflight pfl_… does not exist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/release-test": {
+      "post": {
+        "tags": [
+          "Release tests"
+        ],
+        "operationId": "runReleaseTest",
+        "summary": "Run a release test",
+        "description": "Run a paid release test. This route is protected by x402 v2 and costs 1.00 USDC on Algorand Mainnet.\n\n1. Send the request without payment. Selo validates the body and the preflight first, then answers `402` with a `PAYMENT-REQUIRED` header: base64 JSON offering one `exact` requirement of `1000000` atomic USDC (ASA `31566704`) on `algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=`, tagged `x402-global-challenge`.\n2. Sign that requirement with an x402 v2 client and send the same request again with the `PAYMENT-SIGNATURE` header (base64 JSON payment payload). The x402 v1 header `X-PAYMENT` is not read.\n3. Selo verifies the payment with the facilitator, claims the job, settles, and records the settlement transaction on the job. Only then does it pay your endpoint and run the five checks. The response arrives when the job finishes (wall clock 60 seconds), with a `PAYMENT-RESPONSE` header.\n\nSend an `Idempotency-Key`. A repeat with the same `preflightId` and key returns the first job's result and never settles a second payment, even if it carries a newly signed payment. Without the header, Selo deduplicates on the signed payment itself.",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "8 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` or `-`. Scoped to the `preflightId`.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "minLength": 8,
+              "maxLength": 128
+            },
+            "example": "release-2026-10-26-a"
+          },
+          {
+            "name": "PAYMENT-SIGNATURE",
+            "in": "header",
+            "required": false,
+            "description": "Base64-encoded JSON x402 v2 payment payload that pays the requirement from the 402. Omit it on the first request to receive the challenge.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "<base64 JSON payment payload>"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseTestRequest"
+              },
+              "examples": {
+                "contract": {
+                  "summary": "With a release contract and release ID",
+                  "value": {
+                    "preflightId": "pfl_…",
+                    "profile": "quick",
+                    "expected": {
+                      "status": 200,
+                      "contentType": "application/json",
+                      "jsonSchema": {
+                        "type": "object",
+                        "required": [
+                          "orderId",
+                          "receiptId",
+                          "fulfilled"
+                        ],
+                        "properties": {
+                          "orderId": {
+                            "type": "string",
+                            "pattern": "^ord_[0-9a-f]{24}$"
+                          },
+                          "receiptId": {
+                            "type": "string",
+                            "pattern": "^rcpt_[0-9a-f]{24}$"
+                          },
+                          "fulfilled": {
+                            "const": true
+                          }
+                        }
+                      }
+                    },
+                    "deploymentId": "fixed-v2"
+                  }
+                },
+                "minimal": {
+                  "summary": "Minimal",
+                  "value": {
+                    "preflightId": "pfl_…",
+                    "profile": "quick"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The release test finished, or this request matched an existing finished job (no new payment settled). `verdict` is the gate decision.",
+            "headers": {
+              "PAYMENT-RESPONSE": {
+                "description": "Base64-encoded JSON settlement result. Present when this request settled the payment; absent when the reply is the stored result of an earlier request.",
+                "schema": {
+                  "type": "string",
+                  "contentEncoding": "base64",
+                  "contentMediaType": "application/json",
+                  "contentSchema": {
+                    "$ref": "#/components/schemas/X402SettleResponse"
+                  }
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseTestResponse"
+                },
+                "examples": {
+                  "pass": {
+                    "summary": "PASS: demo merchant fixed-v2 on Mainnet",
+                    "value": {
+                      "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+                      "verdict": "PASS",
+                      "target": "https://demo.useselo.xyz/v1/orders",
+                      "checks": [
+                        {
+                          "id": "handshake",
+                          "status": "PASS",
+                          "code": "HANDSHAKE_VALID",
+                          "blocking": true,
+                          "summary": "Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704.",
+                          "evidence": [
+                            "evd_B23GQN052SFAET2QME89MVYX5G"
+                          ]
+                        },
+                        {
+                          "id": "paid_delivery",
+                          "status": "PASS",
+                          "code": "PAID_AND_DELIVERED",
+                          "blocking": true,
+                          "summary": "Downstream payment settled and target returned 200 with transaction QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ.",
+                          "evidence": [
+                            "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+                            "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"
+                          ]
+                        },
+                        {
+                          "id": "response_contract",
+                          "status": "PASS",
+                          "code": "CONTRACT_MATCHED",
+                          "blocking": true,
+                          "summary": "Observed response matched the expected status 200 and content type application/json.",
+                          "evidence": [
+                            "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+                            "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW"
+                          ]
+                        },
+                        {
+                          "id": "discovery_contract",
+                          "status": "PASS",
+                          "code": "DISCOVERY_CONSISTENT",
+                          "blocking": true,
+                          "summary": "Live challenge and catalog record agree on method, URL, payment terms and carry usable metadata.",
+                          "evidence": [
+                            "evd_TE2XZJB33D4CXHV2EMW84SS6BG"
+                          ]
+                        },
+                        {
+                          "id": "retry_safety",
+                          "status": "PASS",
+                          "code": "PASS_REPLAY_REJECTED",
+                          "blocking": true,
+                          "summary": "Replaying the identical signed payment header was rejected with status 402.",
+                          "evidence": [
+                            "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R"
+                          ]
+                        }
+                      ],
+                      "warnings": [],
+                      "inconclusiveReason": null,
+                      "money": {
+                        "seloInboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+                        "downstreamSpendUsdc": "0.01",
+                        "downstreamTxIds": [
+                          "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"
+                        ]
+                      },
+                      "reportUrl": "https://api.useselo.xyz/v1/reports/<report token>",
+                      "attestation": {
+                        "payload": {
+                          "schemaVersion": "selo.release.v1",
+                          "issuer": "https://api.useselo.xyz",
+                          "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+                          "testedTarget": {
+                            "url": "https://demo.useselo.xyz/v1/orders",
+                            "method": "POST"
+                          },
+                          "deployment": {
+                            "id": "fixed-v2",
+                            "verification": "asserted_by_client"
+                          },
+                          "testedAt": "2026-10-26T10:24:02.883Z",
+                          "completedAt": "2026-10-26T10:24:12.218Z",
+                          "seloVersion": "71080ad",
+                          "verdict": "PASS",
+                          "inconclusiveReason": null,
+                          "checks": [
+                            {
+                              "id": "handshake",
+                              "status": "PASS",
+                              "code": "HANDSHAKE_VALID",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_B23GQN052SFAET2QME89MVYX5G"
+                              ]
+                            },
+                            {
+                              "id": "paid_delivery",
+                              "status": "PASS",
+                              "code": "PAID_AND_DELIVERED",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+                                "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"
+                              ]
+                            },
+                            {
+                              "id": "response_contract",
+                              "status": "PASS",
+                              "code": "CONTRACT_MATCHED",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+                                "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW"
+                              ]
+                            },
+                            {
+                              "id": "discovery_contract",
+                              "status": "PASS",
+                              "code": "DISCOVERY_CONSISTENT",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_TE2XZJB33D4CXHV2EMW84SS6BG"
+                              ]
+                            },
+                            {
+                              "id": "retry_safety",
+                              "status": "PASS",
+                              "code": "PASS_REPLAY_REJECTED",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R"
+                              ]
+                            }
+                          ],
+                          "expectedContractSha256": "6e5b149b1088d214be6a1c097e2e06bf1127fe529c544731023abea7b03e7170",
+                          "targetChallengeSha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc",
+                          "payments": {
+                            "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+                            "asset": "31566704",
+                            "inboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+                            "inboundAmountUsdc": "1.00",
+                            "downstream": [
+                              {
+                                "status": "SETTLED",
+                                "amountUsdc": "0.01",
+                                "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"
+                              }
+                            ]
+                          },
+                          "evidenceSha256": "49d787f15e7001a408f495aa59f4b16214dca58838e9e99ddd4790f6d6565a96",
+                          "evidence": [
+                            {
+                              "id": "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+                              "kind": "paid_response",
+                              "sha256": "7815cd18d10df182be8f325d6d7a3b67800060da3efeff5c9c01fd409794398b"
+                            },
+                            {
+                              "id": "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R",
+                              "kind": "replay_response",
+                              "sha256": "a72223caf72ed2bd2d24114062b7cb15655f0d0e9c8cd4442a3bac9e791cae85"
+                            },
+                            {
+                              "id": "evd_B23GQN052SFAET2QME89MVYX5G",
+                              "kind": "target_challenge",
+                              "sha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc"
+                            },
+                            {
+                              "id": "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW",
+                              "kind": "response_contract",
+                              "sha256": "f3f8cef64a663df7d7c192ff542878b6653df048b227305e50457bab0fab4bd0"
+                            },
+                            {
+                              "id": "evd_MVWEZKMTNT45MWX6RDA8G6HRQ0",
+                              "kind": "authorization_snapshot",
+                              "sha256": "207c2d476ea56e68e5bb88fa34ac5a943912be83251088a30f93f99c515626da"
+                            },
+                            {
+                              "id": "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4",
+                              "kind": "downstream_payment",
+                              "sha256": "cca974ffefb3a23f9528745f1c205e58fc5687e8ef18a0bab527f110fedf609e"
+                            },
+                            {
+                              "id": "evd_SXXV98XNSNVMPPPF7R7YR2RSC8",
+                              "kind": "authorization_snapshot",
+                              "sha256": "208afc651b36a13f9b93c2decb89cc70558559c709d67ca83606ae65bb2f54e1"
+                            },
+                            {
+                              "id": "evd_TE2XZJB33D4CXHV2EMW84SS6BG",
+                              "kind": "catalog_record",
+                              "sha256": "4503636c21768df0807c0dfd88ba1813a9f2fdf9629bdf59fce723ed21e25712"
+                            }
+                          ]
+                        },
+                        "signature": {
+                          "algorithm": "Ed25519",
+                          "keyId": "selo-ed25519-728fcf85650b128f",
+                          "value": "E3lC29kTmj4Ts8SVoEDFabdAGGAO7ZZs4n9p2P7HUWGePMfi4aO75xQ-v7cynT1T4nT6mB2iQZYAzXe2YIbeBg"
+                        }
+                      }
+                    }
+                  },
+                  "fail": {
+                    "summary": "FAIL: demo merchant broken-v1 on Mainnet",
+                    "value": {
+                      "jobId": "job_189NZ481HFH77CRGF60AEF22RG",
+                      "verdict": "FAIL",
+                      "target": "https://demo.useselo.xyz/v1/orders",
+                      "checks": [
+                        {
+                          "id": "handshake",
+                          "status": "PASS",
+                          "code": "HANDSHAKE_VALID",
+                          "blocking": true,
+                          "summary": "Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704.",
+                          "evidence": [
+                            "evd_Z9C3SD9CX9WNS38JFYYGT9K60R"
+                          ]
+                        },
+                        {
+                          "id": "paid_delivery",
+                          "status": "PASS",
+                          "code": "PAID_AND_DELIVERED",
+                          "blocking": true,
+                          "summary": "Downstream payment settled and target returned 200 with transaction RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ.",
+                          "evidence": [
+                            "evd_C3YHMHPAX7S53BNXWHAG5H2MA4",
+                            "evd_4J9CPWEE2MZGT9CFWNYY6WR4VR"
+                          ]
+                        },
+                        {
+                          "id": "response_contract",
+                          "status": "FAIL",
+                          "code": "SCHEMA_MISMATCH",
+                          "blocking": true,
+                          "summary": "Response body did not match the expected schema: must have required property 'receiptId'",
+                          "evidence": [
+                            "evd_C3YHMHPAX7S53BNXWHAG5H2MA4",
+                            "evd_SM1RPAAJH2ZZNMTA11SJK431ZW"
+                          ]
+                        },
+                        {
+                          "id": "discovery_contract",
+                          "status": "INCONCLUSIVE",
+                          "code": "CATALOG_UNAVAILABLE",
+                          "blocking": true,
+                          "summary": "The Bazaar catalog could not be reached to cross-check this resource.",
+                          "evidence": [
+                            "evd_EJ2B9QAS9RHK6T58EW5ZZKNDMM"
+                          ]
+                        },
+                        {
+                          "id": "retry_safety",
+                          "status": "PASS",
+                          "code": "PASS_REPLAY_REJECTED",
+                          "blocking": true,
+                          "summary": "Replaying the identical signed payment header was rejected with status 402.",
+                          "evidence": [
+                            "evd_WVP86FB9SGXNYYK5FGVMD6V1RG"
+                          ]
+                        }
+                      ],
+                      "warnings": [],
+                      "inconclusiveReason": null,
+                      "money": {
+                        "seloInboundTxId": "SVGTX3U6XQLSGJP7L7X7KNPSDLWFBSA3JK7AFNHPWENIWP4YVIEQ",
+                        "downstreamSpendUsdc": "0.01",
+                        "downstreamTxIds": [
+                          "RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ"
+                        ]
+                      },
+                      "reportUrl": "https://api.useselo.xyz/v1/reports/<report token>",
+                      "attestation": {
+                        "payload": {
+                          "schemaVersion": "selo.release.v1",
+                          "issuer": "https://api.useselo.xyz",
+                          "jobId": "job_189NZ481HFH77CRGF60AEF22RG",
+                          "testedTarget": {
+                            "url": "https://demo.useselo.xyz/v1/orders",
+                            "method": "POST"
+                          },
+                          "deployment": {
+                            "id": "broken-v1",
+                            "verification": "asserted_by_client"
+                          },
+                          "testedAt": "2026-10-26T09:43:01.922Z",
+                          "completedAt": "2026-10-26T09:43:09.258Z",
+                          "seloVersion": "b769634",
+                          "verdict": "FAIL",
+                          "inconclusiveReason": null,
+                          "checks": [
+                            {
+                              "id": "handshake",
+                              "status": "PASS",
+                              "code": "HANDSHAKE_VALID",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_Z9C3SD9CX9WNS38JFYYGT9K60R"
+                              ]
+                            },
+                            {
+                              "id": "paid_delivery",
+                              "status": "PASS",
+                              "code": "PAID_AND_DELIVERED",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_C3YHMHPAX7S53BNXWHAG5H2MA4",
+                                "evd_4J9CPWEE2MZGT9CFWNYY6WR4VR"
+                              ]
+                            },
+                            {
+                              "id": "response_contract",
+                              "status": "FAIL",
+                              "code": "SCHEMA_MISMATCH",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_C3YHMHPAX7S53BNXWHAG5H2MA4",
+                                "evd_SM1RPAAJH2ZZNMTA11SJK431ZW"
+                              ]
+                            },
+                            {
+                              "id": "discovery_contract",
+                              "status": "INCONCLUSIVE",
+                              "code": "CATALOG_UNAVAILABLE",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_EJ2B9QAS9RHK6T58EW5ZZKNDMM"
+                              ]
+                            },
+                            {
+                              "id": "retry_safety",
+                              "status": "PASS",
+                              "code": "PASS_REPLAY_REJECTED",
+                              "blocking": true,
+                              "evidence": [
+                                "evd_WVP86FB9SGXNYYK5FGVMD6V1RG"
+                              ]
+                            }
+                          ],
+                          "expectedContractSha256": "6e5b149b1088d214be6a1c097e2e06bf1127fe529c544731023abea7b03e7170",
+                          "targetChallengeSha256": "5efad9f413c7fd81a8b533887b9f28788322628ea7876796a6bd2b6a16c7fdcc",
+                          "payments": {
+                            "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+                            "asset": "31566704",
+                            "inboundTxId": "SVGTX3U6XQLSGJP7L7X7KNPSDLWFBSA3JK7AFNHPWENIWP4YVIEQ",
+                            "inboundAmountUsdc": "1.00",
+                            "downstream": [
+                              {
+                                "status": "SETTLED",
+                                "amountUsdc": "0.01",
+                                "txId": "RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ"
+                              }
+                            ]
+                          },
+                          "evidenceSha256": "c2a9b8746f89dd557865ad4bd6bc79e9fafdf891c3763eef246aa51fb8a52c83",
+                          "evidence": [
+                            {
+                              "id": "evd_4J9CPWEE2MZGT9CFWNYY6WR4VR",
+                              "kind": "downstream_payment",
+                              "sha256": "cc6e48537139f26d0e3d2d4cadf666ce89ffc07a0c4830c116e38afb2945f458"
+                            },
+                            {
+                              "id": "evd_8HCAE38TGE111B2BXFEY0QMKRW",
+                              "kind": "authorization_snapshot",
+                              "sha256": "02baba31af9c657ac17906f6c6aee56f2a7c25905b42a7cf34f5463d0b08c95d"
+                            },
+                            {
+                              "id": "evd_C3YHMHPAX7S53BNXWHAG5H2MA4",
+                              "kind": "paid_response",
+                              "sha256": "e67b250cbb92954c1e098307b6709dbe474e25d9743344233414950f6187a6f7"
+                            },
+                            {
+                              "id": "evd_EJ2B9QAS9RHK6T58EW5ZZKNDMM",
+                              "kind": "catalog_record",
+                              "sha256": "77ae5d181bdd2002b067f10f2aae0fc5b0562b39ed1036770fc9c982b37d4b2f"
+                            },
+                            {
+                              "id": "evd_MC9R0VM5PTZDZJ62NQNFDBE8CW",
+                              "kind": "authorization_snapshot",
+                              "sha256": "f277c070af27ed5c8642b95d9c354e70613ad12fbb9f4426656c66f4fb36bcb7"
+                            },
+                            {
+                              "id": "evd_SM1RPAAJH2ZZNMTA11SJK431ZW",
+                              "kind": "response_contract",
+                              "sha256": "5df97c8b2371600b267d2cc3600ea49964a64e0145f9a3bda4ffb36b5750b89c"
+                            },
+                            {
+                              "id": "evd_WVP86FB9SGXNYYK5FGVMD6V1RG",
+                              "kind": "replay_response",
+                              "sha256": "f1ff2bceb92be880f056ca6225fecd177ceee10560d8a74762615defeb00ff22"
+                            },
+                            {
+                              "id": "evd_Z9C3SD9CX9WNS38JFYYGT9K60R",
+                              "kind": "target_challenge",
+                              "sha256": "5efad9f413c7fd81a8b533887b9f28788322628ea7876796a6bd2b6a16c7fdcc"
+                            }
+                          ]
+                        },
+                        "signature": {
+                          "algorithm": "Ed25519",
+                          "keyId": "selo-ed25519-728fcf85650b128f",
+                          "value": "R78F8R3mz7TntBJwiKb7M6Lq4BmBmOYJEWKFRrOqjDqwFCOTrr-11n2d4VHrGqTYMq-HcXd2X0skuR4uyaDpBg"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body, the `Idempotency-Key` header or the `expected` contract is invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "VALIDATION_FAILED": {
+                    "summary": "Unknown profile",
+                    "value": {
+                      "error": "VALIDATION_FAILED",
+                      "message": "✖ Invalid input: expected \"quick\"\n  → at profile"
+                    }
+                  },
+                  "IDEMPOTENCY_KEY": {
+                    "summary": "Malformed Idempotency-Key",
+                    "value": {
+                      "error": "VALIDATION_FAILED",
+                      "message": "Idempotency-Key must be 8-128 characters of A-Z, a-z, 0-9, _ or -"
+                    }
+                  },
+                  "CONTRACT": {
+                    "summary": "Contract does not compile",
+                    "value": {
+                      "error": "VALIDATION_FAILED",
+                      "message": "expected: status must be an integer between 100 and 599, received 700"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Payment required. Returned when no `PAYMENT-SIGNATURE` was sent, when the payment was refused at verification, or when settlement definitely failed. The body is an empty JSON object.",
+            "headers": {
+              "PAYMENT-REQUIRED": {
+                "description": "Base64-encoded JSON x402 v2 challenge. Present when Selo asks for payment: no payment was sent, or the payment was refused at verification, in which case `error` says why.",
+                "schema": {
+                  "type": "string",
+                  "contentEncoding": "base64",
+                  "contentMediaType": "application/json",
+                  "contentSchema": {
+                    "$ref": "#/components/schemas/X402PaymentRequired"
+                  }
+                },
+                "example": "<base64 JSON challenge>"
+              },
+              "PAYMENT-RESPONSE": {
+                "description": "Base64-encoded JSON settlement result with `success: false`. Present instead of `PAYMENT-REQUIRED` when settlement definitely failed; nothing was charged and no job remains.",
+                "schema": {
+                  "type": "string",
+                  "contentEncoding": "base64",
+                  "contentMediaType": "application/json",
+                  "contentSchema": {
+                    "$ref": "#/components/schemas/X402SettleResponse"
+                  }
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "no-store"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "maxProperties": 0
+                },
+                "example": {}
+              }
+            }
+          },
+          "403": {
+            "description": "The preflight's authorization is no longer verified and unexpired.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "AUTHORIZATION_INVALID": {
+                    "summary": "Authorization lapsed",
+                    "value": {
+                      "error": "AUTHORIZATION_INVALID",
+                      "message": "Authorization auth_… is not a verified, unexpired authorization for this target"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No preflight with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "PREFLIGHT_NOT_FOUND": {
+                    "summary": "Unknown preflight",
+                    "value": {
+                      "error": "PREFLIGHT_NOT_FOUND",
+                      "message": "Preflight pfl_… does not exist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The preflight expired, or the request matched a job that is still running or finished without a report.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/JobError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/JobTerminalError"
+                    }
+                  ]
+                },
+                "examples": {
+                  "PREFLIGHT_EXPIRED": {
+                    "summary": "Preflight older than 15 minutes",
+                    "value": {
+                      "error": "PREFLIGHT_EXPIRED",
+                      "message": "Preflight pfl_… has expired; run a new preflight"
+                    }
+                  },
+                  "JOB_IN_PROGRESS": {
+                    "summary": "Same request still running",
+                    "value": {
+                      "error": "JOB_IN_PROGRESS",
+                      "message": "A release test for this request is already running; retry to fetch its result",
+                      "jobId": "job_…"
+                    }
+                  },
+                  "JOB_IN_PROGRESS_CLAIM": {
+                    "summary": "Same key being claimed",
+                    "value": {
+                      "error": "JOB_IN_PROGRESS",
+                      "message": "A request with the same idempotency key is being resolved; retry shortly"
+                    }
+                  },
+                  "JOB_TERMINAL": {
+                    "summary": "Matched job ended without a report",
+                    "value": {
+                      "error": "JOB_TERMINAL",
+                      "message": "This release test already finished without a report; start a new preflight to retest",
+                      "jobId": "job_…",
+                      "status": "INCONCLUSIVE",
+                      "inconclusiveReason": "INTERNAL_ERROR"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "description": "The preflight is not eligible, or the target's price is above the per-job spend limit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "PREFLIGHT_INELIGIBLE": {
+                    "summary": "Ineligible preflight",
+                    "value": {
+                      "error": "PREFLIGHT_INELIGIBLE",
+                      "message": "Preflight pfl_… is not eligible (NO_PAYMENT_CHALLENGE)"
+                    }
+                  },
+                  "PRICE_OVER_BUDGET": {
+                    "summary": "Price above 0.50 USDC",
+                    "value": {
+                      "error": "PRICE_OVER_BUDGET",
+                      "message": "The target price exceeds the per-job downstream spend limit"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Selo failed after your payment settled (`jobId` present, job flagged for reconciliation or recorded as INCONCLUSIVE), or failed before charging (no `jobId`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/JobError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApiError"
+                    }
+                  ]
+                },
+                "examples": {
+                  "INBOUND_RECORD_FAILED": {
+                    "summary": "Settled but not recorded",
+                    "value": {
+                      "error": "INBOUND_RECORD_FAILED",
+                      "message": "Your payment settled but Selo could not record it; the job will not run and is flagged for reconciliation",
+                      "jobId": "job_…"
+                    }
+                  },
+                  "INTERNAL_AFTER_SETTLEMENT": {
+                    "summary": "Failed after settlement",
+                    "value": {
+                      "error": "INTERNAL",
+                      "message": "Selo failed after settling your payment; the job is recorded as INCONCLUSIVE",
+                      "jobId": "job_…"
+                    }
+                  },
+                  "INTERNAL": {
+                    "summary": "Unexpected server error",
+                    "value": {
+                      "error": "INTERNAL",
+                      "message": "Internal server error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The facilitator could not verify the payment (nothing charged), or did not confirm the settlement outcome (job held; do not pay again).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InboundUnresolvedError"
+                    }
+                  ]
+                },
+                "examples": {
+                  "FACILITATOR_UNAVAILABLE": {
+                    "summary": "Verification failed",
+                    "value": {
+                      "error": "FACILITATOR_UNAVAILABLE",
+                      "message": "The payment facilitator could not verify the payment; nothing was charged"
+                    }
+                  },
+                  "INBOUND_SETTLEMENT_UNRESOLVED": {
+                    "summary": "Settlement outcome unknown",
+                    "value": {
+                      "error": "INBOUND_SETTLEMENT_UNRESOLVED",
+                      "message": "The facilitator did not confirm the outcome of your payment; the job is held for reconciliation and will not run. Do not pay again for this request.",
+                      "jobId": "job_…",
+                      "txId": null
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/reports/{token}": {
+      "get": {
+        "tags": [
+          "Reports"
+        ],
+        "operationId": "getReport",
+        "summary": "Get a private report",
+        "description": "Read the full report of a finished release test. The token is the last path segment of `reportUrl`. The token is the only credential: anyone who has the link can read the report, so keep it out of logs and public CI output. Responses carry `noindex`, `no-store` and `no-referrer` headers.",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "description": "43-character report token from `reportUrl`.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "example": "<report token>"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The report. Example built from the fixed-v2 demo run; values in angle brackets are placeholders because the private report is not published.",
+            "headers": {
+              "X-Robots-Tag": {
+                "description": "`noindex, nofollow`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "noindex, nofollow"
+              },
+              "Cache-Control": {
+                "description": "`private, no-store`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "private, no-store"
+              },
+              "Referrer-Policy": {
+                "description": "`no-referrer`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "no-referrer"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseReport"
+                },
+                "example": {
+                  "jobId": "job_51AZ2WJZ78RF1WZC316Q1K38GG",
+                  "project": "<project from the authorization>",
+                  "target": {
+                    "url": "https://demo.useselo.xyz/v1/orders",
+                    "method": "POST"
+                  },
+                  "testedAt": "2026-10-26T10:24:02.883Z",
+                  "completedAt": "2026-10-26T10:24:12.218Z",
+                  "seloVersion": "71080ad",
+                  "verdict": "PASS",
+                  "inconclusiveReason": null,
+                  "checks": [
+                    {
+                      "id": "handshake",
+                      "status": "PASS",
+                      "code": "HANDSHAKE_VALID",
+                      "blocking": true,
+                      "summary": "Target issued a valid x402 v2 challenge with a supported requirement for network algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8= and asset 31566704.",
+                      "evidence": [
+                        "evd_B23GQN052SFAET2QME89MVYX5G"
+                      ]
+                    },
+                    {
+                      "id": "paid_delivery",
+                      "status": "PASS",
+                      "code": "PAID_AND_DELIVERED",
+                      "blocking": true,
+                      "summary": "Downstream payment settled and target returned 200 with transaction QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ.",
+                      "evidence": [
+                        "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+                        "evd_PYNAQNMTD7KQJSJ0ZM6D618AK4"
+                      ]
+                    },
+                    {
+                      "id": "response_contract",
+                      "status": "PASS",
+                      "code": "CONTRACT_MATCHED",
+                      "blocking": true,
+                      "summary": "Observed response matched the expected status 200 and content type application/json.",
+                      "evidence": [
+                        "evd_6K2ASNC2G3JG43Q0XE0MSXJATM",
+                        "evd_EKR9NXGB5HRGPQ4ZBN3WM914FW"
+                      ]
+                    },
+                    {
+                      "id": "discovery_contract",
+                      "status": "PASS",
+                      "code": "DISCOVERY_CONSISTENT",
+                      "blocking": true,
+                      "summary": "Live challenge and catalog record agree on method, URL, payment terms and carry usable metadata.",
+                      "evidence": [
+                        "evd_TE2XZJB33D4CXHV2EMW84SS6BG"
+                      ]
+                    },
+                    {
+                      "id": "retry_safety",
+                      "status": "PASS",
+                      "code": "PASS_REPLAY_REJECTED",
+                      "blocking": true,
+                      "summary": "Replaying the identical signed payment header was rejected with status 402.",
+                      "evidence": [
+                        "evd_7ZVACZFH5PNMZAQ5T82YZN7Z9R"
+                      ]
+                    }
+                  ],
+                  "warnings": [],
+                  "failureCodes": [],
+                  "targetChallengeSha256": "39793a689d67cb18a7a59fca4a2d6211575e577bc2496accee3c93bd0ca2e7cc",
+                  "expected": {
+                    "status": 200,
+                    "contentType": "application/json",
+                    "jsonSchema": {
+                      "type": "object",
+                      "required": [
+                        "orderId",
+                        "receiptId",
+                        "fulfilled"
+                      ],
+                      "properties": {
+                        "orderId": {
+                          "type": "string",
+                          "pattern": "^ord_[0-9a-f]{24}$"
+                        },
+                        "receiptId": {
+                          "type": "string",
+                          "pattern": "^rcpt_[0-9a-f]{24}$"
+                        },
+                        "fulfilled": {
+                          "const": true
+                        }
+                      }
+                    }
+                  },
+                  "observedResponse": {
+                    "status": 200,
+                    "contentType": "application/json",
+                    "bodySha256": "<sha256 hex of the paid response body>",
+                    "bodyBytes": "<body size in bytes>",
+                    "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ",
+                    "requestedAt": "<ISO 8601 time of the paid request>"
+                  },
+                  "money": {
+                    "inboundTxId": "EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA",
+                    "downstreamSpendUsdc": "0.01",
+                    "unresolvedSpendUsdc": "0.00",
+                    "downstreamTxIds": [
+                      "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"
+                    ],
+                    "payments": [
+                      {
+                        "status": "SETTLED",
+                        "amountUsdc": "0.01",
+                        "txId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ",
+                        "expectedTxId": "QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ"
+                      }
+                    ]
+                  },
+                  "scenarios": [
+                    {
+                      "check": "handshake",
+                      "operationId": "job_51AZ2WJZ78RF1WZC316Q1K38GG:handshake",
+                      "status": "EVALUATED",
+                      "attempts": "<attempt count>",
+                      "durationMs": "<milliseconds>",
+                      "failureCode": null
+                    },
+                    {
+                      "check": "paid_delivery",
+                      "operationId": "job_51AZ2WJZ78RF1WZC316Q1K38GG:paid_delivery",
+                      "status": "EVALUATED",
+                      "attempts": "<attempt count>",
+                      "durationMs": "<milliseconds>",
+                      "failureCode": null
+                    },
+                    {
+                      "check": "response_contract",
+                      "operationId": "job_51AZ2WJZ78RF1WZC316Q1K38GG:response_contract",
+                      "status": "EVALUATED",
+                      "attempts": "<attempt count>",
+                      "durationMs": "<milliseconds>",
+                      "failureCode": null
+                    },
+                    {
+                      "check": "discovery_contract",
+                      "operationId": "job_51AZ2WJZ78RF1WZC316Q1K38GG:discovery_contract",
+                      "status": "EVALUATED",
+                      "attempts": "<attempt count>",
+                      "durationMs": "<milliseconds>",
+                      "failureCode": null
+                    },
+                    {
+                      "check": "retry_safety",
+                      "operationId": "job_51AZ2WJZ78RF1WZC316Q1K38GG:retry_safety",
+                      "status": "EVALUATED",
+                      "attempts": "<attempt count>",
+                      "durationMs": "<milliseconds>",
+                      "failureCode": null
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or malformed token, or the job has no written report.",
+            "headers": {
+              "X-Robots-Tag": {
+                "description": "`noindex, nofollow`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "noindex, nofollow"
+              },
+              "Cache-Control": {
+                "description": "`private, no-store`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "private, no-store"
+              },
+              "Referrer-Policy": {
+                "description": "`no-referrer`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "no-referrer"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "error": "NOT_FOUND",
+                  "message": "Report not found"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/.well-known/selo-attestation-keys.json": {
+      "get": {
+        "tags": [
+          "Attestation keys"
+        ],
+        "operationId": "getAttestationKeys",
+        "summary": "Get attestation keys",
+        "description": "Public Ed25519 keys that verify the `attestation` on release test responses. Match `signature.keyId` to a key, then verify the signature over the canonical JSON of `payload`. Cacheable for 5 minutes.",
+        "responses": {
+          "200": {
+            "description": "The key set.",
+            "headers": {
+              "Cache-Control": {
+                "description": "`public, max-age=300`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "public, max-age=300"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttestationKeySet"
+                },
+                "example": {
+                  "keys": [
+                    {
+                      "keyId": "selo-ed25519-728fcf85650b128f",
+                      "algorithm": "Ed25519",
+                      "publicKey": "IiUpeUTzfsbOg5-hV6i3eLnqU4uJ7hog31HmgXoc0ZQ"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/llms.txt": {
+      "get": {
+        "tags": [
+          "Discovery"
+        ],
+        "operationId": "getLlmsTxt",
+        "summary": "Get llms.txt",
+        "description": "Plain-text description of Selo and its endpoints for language-model agents.",
+        "responses": {
+          "200": {
+            "description": "The llms.txt file.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "# Selo\n\n> CI for x402. It pays your endpoint before your users do.\n\nRun an authorized x402 release test. Selo settles the request, pays the target endpoint, verifies payment and response behavior, and returns an evidence-backed PASS, FAIL, or INCONCLUSIVE report.\n\n## Endpoints\n\n- POST https://api.useselo.xyz/v1/authorizations: request a verification challenge for a target route (free)\n- POST https://api.useselo.xyz/v1/preflight: check a target is testable and within budget (free)\n- POST https://api.useselo.xyz/v1/release-test: run the release test (paid with x402, 1.00 USDC on Algorand)\n- GET https://api.useselo.xyz/v1/reports/%7Btoken%7D: private report\n"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/.well-known/agent-card.json": {
+      "get": {
+        "tags": [
+          "Discovery"
+        ],
+        "operationId": "getAgentCard",
+        "summary": "Get the agent card",
+        "description": "Machine-readable card describing Selo and its `x402-release-test` skill.",
+        "responses": {
+          "200": {
+            "description": "The agent card.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentCard"
+                },
+                "examples": {
+                  "live": {
+                    "summary": "Live response",
+                    "value": {
+                      "name": "Selo",
+                      "description": "CI for x402. It pays your endpoint before your users do. Run an authorized x402 release test. Selo settles the request, pays the target endpoint, verifies payment and response behavior, and returns an evidence-backed PASS, FAIL, or INCONCLUSIVE report.",
+                      "url": "https://api.useselo.xyz",
+                      "iconUrl": "https://useselo.xyz/brand/selo-logo-512.png",
+                      "version": "1.0.0",
+                      "provider": {
+                        "organization": "Selo",
+                        "url": "https://api.useselo.xyz"
+                      },
+                      "capabilities": {},
+                      "defaultInputModes": [
+                        "application/json"
+                      ],
+                      "defaultOutputModes": [
+                        "application/json"
+                      ],
+                      "skills": [
+                        {
+                          "id": "x402-release-test",
+                          "name": "x402 release test",
+                          "description": "Run an authorized x402 release test. Selo settles the request, pays the target endpoint, verifies payment and response behavior, and returns an evidence-backed PASS, FAIL, or INCONCLUSIVE report.",
+                          "tags": [
+                            "x402",
+                            "algorand",
+                            "testing",
+                            "developer-tools"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "tags": [
+          "Discovery"
+        ],
+        "operationId": "getHomepage",
+        "summary": "Get the API homepage",
+        "description": "A minimal HTML page naming Selo and its paid route.",
+        "responses": {
+          "200": {
+            "description": "HTML page.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "getHealth",
+        "summary": "Check health",
+        "description": "Liveness check. Returns 200 only when the API can query its database.",
+        "responses": {
+          "200": {
+            "description": "The API and its database answer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                },
+                "examples": {
+                  "ok": {
+                    "summary": "Healthy",
+                    "value": {
+                      "status": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Verdict": {
+        "type": "string",
+        "enum": [
+          "PASS",
+          "FAIL",
+          "INCONCLUSIVE"
+        ],
+        "description": "Release verdict computed by the deterministic verdict reducer."
+      },
+      "Profile": {
+        "type": "string",
+        "enum": [
+          "quick"
+        ],
+        "description": "Release test profile. `quick` is the only profile."
+      },
+      "HttpMethod": {
+        "type": "string",
+        "enum": [
+          "GET",
+          "POST"
+        ],
+        "description": "HTTP method Selo uses to call the target."
+      },
+      "AuthorizationStatus": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "VERIFIED",
+          "EXPIRED",
+          "REVOKED"
+        ],
+        "description": "`PENDING`: challenge issued, not yet verified. `VERIFIED`: Selo found the token and may test the target until `expiresAt`. `EXPIRED`: the challenge or the authorization lapsed. `REVOKED`: the authorization was withdrawn."
+      },
+      "AuthorizationType": {
+        "type": "string",
+        "enum": [
+          "well_known_file",
+          "manual_owner_consent"
+        ],
+        "description": "`well_known_file`: verified through `/.well-known/selo-verification.txt` on the target origin. `manual_owner_consent`: an explicit consent recorded by the Selo operator."
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "READY",
+          "INBOUND_SETTLED",
+          "QUEUED",
+          "RUNNING_PREFLIGHT_RECHECK",
+          "RUNNING",
+          "ANALYZING",
+          "PASS",
+          "FAIL",
+          "INCONCLUSIVE",
+          "REPORT_WRITTEN"
+        ],
+        "description": "Internal state of a release job. A job whose report is available is `REPORT_WRITTEN`."
+      },
+      "ScenarioStatus": {
+        "type": "string",
+        "enum": [
+          "PLANNED",
+          "POLICY_CHECKED",
+          "RESERVED",
+          "REQUESTING",
+          "SETTLED",
+          "REJECTED",
+          "TIMEOUT_UNRESOLVED",
+          "EVALUATED"
+        ],
+        "description": "State of one check's scenario inside a job."
+      },
+      "PaymentStatus": {
+        "type": "string",
+        "enum": [
+          "RESERVED",
+          "SETTLED",
+          "RELEASED",
+          "UNRESOLVED"
+        ],
+        "description": "State of one downstream payment. `RESERVED`: budget held before signing. `SETTLED`: confirmed on chain. `RELEASED`: definitely not paid, budget returned. `UNRESOLVED`: outcome unknown, amount held and never released by a timeout."
+      },
+      "CheckId": {
+        "type": "string",
+        "enum": [
+          "handshake",
+          "paid_delivery",
+          "response_contract",
+          "discovery_contract",
+          "retry_safety"
+        ],
+        "description": "The five release checks, always reported in this order."
+      },
+      "CheckStatus": {
+        "type": "string",
+        "enum": [
+          "PASS",
+          "WARN",
+          "FAIL",
+          "INCONCLUSIVE"
+        ],
+        "description": "Outcome of one check."
+      },
+      "RetryOutcome": {
+        "type": "string",
+        "enum": [
+          "PASS_SAFE_RETRY",
+          "PASS_REPLAY_REJECTED",
+          "WARN_NO_IDEMPOTENCY_CONTRACT",
+          "FAIL_DUPLICATE_SIDE_EFFECT",
+          "INCONCLUSIVE"
+        ],
+        "description": "Result code of the `retry_safety` check, which replays the identical signed payment once."
+      },
+      "SpendDenialReason": {
+        "type": "string",
+        "enum": [
+          "AUTHORIZATION_INVALID",
+          "AUTHORIZATION_EXPIRED",
+          "JOB_NOT_RUNNING",
+          "ORIGIN_NOT_AUTHORIZED",
+          "NETWORK_NOT_ALLOWED",
+          "ASSET_NOT_ALLOWED",
+          "PAYMENT_UNRESOLVED",
+          "SCENARIO_BUDGET_EXCEEDED",
+          "JOB_BUDGET_EXCEEDED",
+          "ABSOLUTE_CAP_EXCEEDED"
+        ],
+        "description": "Why the spend guard refused a downstream payment before signing. Evaluated in this order; the first failing rule wins."
+      },
+      "InconclusiveReason": {
+        "type": "string",
+        "enum": [
+          "NETWORK_UNAVAILABLE",
+          "FACILITATOR_UNAVAILABLE",
+          "TARGET_TIMEOUT",
+          "BUDGET_EXHAUSTED",
+          "PAYMENT_UNRESOLVED",
+          "EVIDENCE_INCOMPLETE",
+          "AUTHORIZATION_LAPSED",
+          "INTERNAL_ERROR"
+        ],
+        "description": "Why a job ended INCONCLUSIVE. `null` on PASS and FAIL."
+      },
+      "PreflightRejection": {
+        "type": "string",
+        "enum": [
+          "AUTHORIZATION_MISSING",
+          "AUTHORIZATION_EXPIRED",
+          "TARGET_URL_INVALID",
+          "TARGET_NOT_HTTPS",
+          "TARGET_ADDRESS_BLOCKED",
+          "METHOD_NOT_ALLOWED",
+          "TARGET_UNREACHABLE",
+          "NO_PAYMENT_CHALLENGE",
+          "NETWORK_NOT_SUPPORTED",
+          "ASSET_NOT_SUPPORTED",
+          "PRICE_OVER_BUDGET"
+        ],
+        "description": "Why a target is not eligible for a release test."
+      },
+      "DecimalAmount": {
+        "type": "string",
+        "pattern": "^[0-9]+\\.[0-9]{2,6}$",
+        "description": "USDC amount as a decimal string with 2 to 6 decimals, for example `1.00` or `0.01`."
+      },
+      "ApiError": {
+        "type": "object",
+        "description": "Error body returned by every failing request.",
+        "required": [
+          "error",
+          "message"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Stable machine-readable error code, for example `VALIDATION_FAILED`."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation. Do not parse it."
+          }
+        }
+      },
+      "JobError": {
+        "type": "object",
+        "description": "Error body for a paid request that already created a job.",
+        "required": [
+          "error",
+          "message",
+          "jobId"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation."
+          },
+          "jobId": {
+            "type": "string",
+            "description": "The job this request created or matched, `job_` plus 26 characters."
+          }
+        }
+      },
+      "JobTerminalError": {
+        "type": "object",
+        "description": "The matched job finished without a report. Start a new preflight to retest.",
+        "required": [
+          "error",
+          "message",
+          "jobId",
+          "status",
+          "inconclusiveReason"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "const": "JOB_TERMINAL"
+          },
+          "message": {
+            "type": "string"
+          },
+          "jobId": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "inconclusiveReason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InconclusiveReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "InboundUnresolvedError": {
+        "type": "object",
+        "description": "The facilitator did not confirm the outcome of your payment. The job is held for reconciliation and does not run. Do not pay again for this request.",
+        "required": [
+          "error",
+          "message",
+          "jobId",
+          "txId"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "const": "INBOUND_SETTLEMENT_UNRESOLVED"
+          },
+          "message": {
+            "type": "string"
+          },
+          "jobId": {
+            "type": "string"
+          },
+          "txId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Settlement transaction ID if the facilitator reported one, otherwise `null`."
+          }
+        }
+      },
+      "CreateAuthorizationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "targetUrl",
+          "method",
+          "project",
+          "contact"
+        ],
+        "properties": {
+          "targetUrl": {
+            "type": "string",
+            "maxLength": 2048,
+            "format": "uri",
+            "description": "Absolute `https` URL of the paid route. The hostname must be a public name (no IP literal, no single-label name such as `localhost`, no name ending in `.localhost`, `.local`, `.internal`, `.home.arpa` or `.lan`), on the default port, with no user name or password. The authorization covers this exact origin and path."
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpMethod"
+          },
+          "project": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "description": "Project name, 1 to 80 characters after trimming. It appears in the private report."
+          },
+          "contact": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 200,
+            "description": "Contact for the target owner, 3 to 200 characters after trimming. Stored, not returned."
+          }
+        }
+      },
+      "AuthorizationChallenge": {
+        "type": "object",
+        "description": "A new authorization and the verification token to publish. The challenge stays open for one hour.",
+        "required": [
+          "authorizationId",
+          "status",
+          "origin",
+          "routePath",
+          "method",
+          "verificationUrl",
+          "expectedContent"
+        ],
+        "properties": {
+          "authorizationId": {
+            "type": "string",
+            "description": "Authorization ID, `auth_` plus 26 Crockford base32 characters."
+          },
+          "status": {
+            "$ref": "#/components/schemas/AuthorizationStatus"
+          },
+          "origin": {
+            "type": "string",
+            "description": "Origin of the target URL, for example `https://api.example.com`."
+          },
+          "routePath": {
+            "type": "string",
+            "description": "Path of the target URL, without query string."
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpMethod"
+          },
+          "verificationUrl": {
+            "type": "string",
+            "description": "Where Selo looks for the token: `<origin>/.well-known/selo-verification.txt`."
+          },
+          "expectedContent": {
+            "type": "string",
+            "description": "The exact line to serve in the verification file: `selo-verification=` followed by a 43-character base64url token. Selo stores only the SHA-256 of the token."
+          }
+        }
+      },
+      "Authorization": {
+        "type": "object",
+        "description": "Current state of an authorization. Reading it moves a lapsed `PENDING` or `VERIFIED` authorization to `EXPIRED`.",
+        "required": [
+          "authorizationId",
+          "status",
+          "origin",
+          "routePath",
+          "method",
+          "type",
+          "verifiedAt",
+          "expiresAt"
+        ],
+        "properties": {
+          "authorizationId": {
+            "type": "string",
+            "description": "`auth_` plus 26 Crockford base32 characters."
+          },
+          "status": {
+            "$ref": "#/components/schemas/AuthorizationStatus"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "routePath": {
+            "type": "string"
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpMethod"
+          },
+          "type": {
+            "$ref": "#/components/schemas/AuthorizationType"
+          },
+          "verifiedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When Selo verified the token, or `null` while pending."
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "While `PENDING`, when the challenge closes (one hour after creation). Once `VERIFIED`, when the authorization lapses (24 hours after verification)."
+          }
+        }
+      },
+      "PreflightRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authorizationId",
+          "targetUrl",
+          "method"
+        ],
+        "properties": {
+          "authorizationId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "A verified authorization that covers this origin, path and method."
+          },
+          "targetUrl": {
+            "type": "string",
+            "maxLength": 2048,
+            "format": "uri",
+            "description": "Absolute `https` URL of the paid route. A query string is sent to the target; coverage is checked on origin and path."
+          },
+          "method": {
+            "$ref": "#/components/schemas/HttpMethod"
+          },
+          "requestBody": {
+            "description": "JSON body Selo sends to the target on every request of this test. Only with `POST`. Any JSON value except `null`, at most 16 KiB (16384 bytes) once serialized. Omit it to send no body.",
+            "type": [
+              "object",
+              "array",
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        }
+      },
+      "PreflightEligible": {
+        "type": "object",
+        "description": "The target can be tested. Pass `preflightId` to `POST /v1/release-test` before `expiresAt`.",
+        "required": [
+          "eligible",
+          "preflightId",
+          "target",
+          "estimatedMaxSpendUsdc",
+          "seloPriceUsdc",
+          "expiresAt"
+        ],
+        "properties": {
+          "eligible": {
+            "type": "boolean",
+            "const": true
+          },
+          "preflightId": {
+            "type": "string",
+            "description": "`pfl_` plus 26 Crockford base32 characters."
+          },
+          "target": {
+            "type": "object",
+            "required": [
+              "url",
+              "method",
+              "priceUsdc"
+            ],
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "Normalized target URL (fragment removed)."
+              },
+              "method": {
+                "$ref": "#/components/schemas/HttpMethod"
+              },
+              "priceUsdc": {
+                "type": "string",
+                "pattern": "^[0-9]+\\.[0-9]{2,6}$",
+                "description": "Price the target asked for in its 402 challenge."
+              }
+            }
+          },
+          "estimatedMaxSpendUsdc": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]{2,6}$",
+            "description": "What Selo expects to pay the target: one paid request at the target's price."
+          },
+          "seloPriceUsdc": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]{2,6}$",
+            "description": "What the release test costs you, paid to Selo over x402."
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The preflight is valid for 15 minutes."
+          }
+        }
+      },
+      "PreflightIneligible": {
+        "type": "object",
+        "description": "The target cannot be tested. Nothing was paid.",
+        "required": [
+          "eligible",
+          "preflightId",
+          "reason",
+          "message"
+        ],
+        "properties": {
+          "eligible": {
+            "type": "boolean",
+            "const": false
+          },
+          "preflightId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ID of the stored preflight, or `null` when Selo refused the request before storing it (invalid URL, blocked hostname, unknown authorization)."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/PreflightRejection"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "PreflightResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/PreflightEligible"
+          },
+          {
+            "$ref": "#/components/schemas/PreflightIneligible"
+          }
+        ]
+      },
+      "ExpectedContract": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "What the paid response must look like. Omitted fields are not checked, except `status`, which defaults to 200.",
+        "properties": {
+          "status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599,
+            "default": 200,
+            "description": "Expected HTTP status of the paid response."
+          },
+          "contentType": {
+            "type": "string",
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$",
+            "description": "Expected media type, `type/subtype`, compared case-insensitively."
+          },
+          "jsonSchema": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "JSON Schema the paid response body must satisfy. Compiled with Ajv 8 in strict mode; at most 16 KiB (16384 bytes) serialized. A schema that does not compile is rejected with 400."
+          }
+        }
+      },
+      "ReleaseTestRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "preflightId",
+          "profile"
+        ],
+        "properties": {
+          "preflightId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "ID of an eligible, unexpired preflight."
+          },
+          "profile": {
+            "$ref": "#/components/schemas/Profile"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ExpectedContract"
+          },
+          "deploymentId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "description": "Your release identifier, for example a commit SHA. Stored on the job and attested as `asserted_by_client`: Selo records it, it does not verify it."
+          }
+        }
+      },
+      "CheckResult": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "code",
+          "blocking",
+          "summary",
+          "evidence"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/CheckId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckStatus"
+          },
+          "code": {
+            "type": "string",
+            "description": "Result code, for example `HANDSHAKE_VALID`, `SCHEMA_MISMATCH` or `NOT_RUN`. For `retry_safety` it is a `RetryOutcome`."
+          },
+          "blocking": {
+            "type": "boolean",
+            "description": "Whether the check can decide the verdict. Every check in the `quick` profile is blocking."
+          },
+          "summary": {
+            "type": "string",
+            "description": "One sentence describing what Selo observed."
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^evd_[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "description": "IDs of the evidence records behind this result. A PASS without evidence counts as INCONCLUSIVE."
+          }
+        }
+      },
+      "ReleaseTestResponse": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "verdict",
+          "target",
+          "checks",
+          "warnings",
+          "inconclusiveReason",
+          "money",
+          "reportUrl"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string",
+            "pattern": "^job_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/Verdict"
+          },
+          "target": {
+            "type": "string",
+            "description": "The tested URL."
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckResult"
+            },
+            "minItems": 5,
+            "maxItems": 5,
+            "description": "All five checks, in fixed order."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "One line per WARN check (and per non-blocking FAIL or INCONCLUSIVE), formatted `<check id>: <summary>`."
+          },
+          "inconclusiveReason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InconclusiveReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "money": {
+            "type": "object",
+            "required": [
+              "seloInboundTxId",
+              "downstreamSpendUsdc",
+              "downstreamTxIds"
+            ],
+            "properties": {
+              "seloInboundTxId": {
+                "type": "string",
+                "description": "Algorand transaction ID of your payment to Selo."
+              },
+              "downstreamSpendUsdc": {
+                "type": "string",
+                "pattern": "^[0-9]+\\.[0-9]{2,6}$",
+                "description": "USDC Selo paid the target and saw settle."
+              },
+              "downstreamTxIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Algorand transaction IDs of Selo's settled payments to the target."
+              }
+            }
+          },
+          "reportUrl": {
+            "type": "string",
+            "description": "Private report link, `https://api.useselo.xyz/v1/reports/<token>`. Anyone with it can read the report."
+          },
+          "attestation": {
+            "$ref": "#/components/schemas/ReleaseAttestation"
+          }
+        }
+      },
+      "AttestedCheck": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "code",
+          "blocking",
+          "evidence"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/CheckId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckStatus"
+          },
+          "code": {
+            "type": "string"
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^evd_[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        }
+      },
+      "AttestedEvidence": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "sha256"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evd_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "kind": {
+            "type": "string",
+            "description": "Evidence kind: `authorization_snapshot`, `target_challenge`, `paid_response`, `downstream_payment`, `response_contract`, `catalog_record` or `replay_response`."
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of the sanitized evidence record."
+          }
+        }
+      },
+      "AttestedPayment": {
+        "type": "object",
+        "required": [
+          "status",
+          "amountUsdc",
+          "txId"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/PaymentStatus"
+          },
+          "amountUsdc": {
+            "$ref": "#/components/schemas/DecimalAmount"
+          },
+          "txId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "AttestationPayload": {
+        "type": "object",
+        "description": "The signed statement. Selo signs the canonical JSON of this object (keys sorted at every level, no whitespace).",
+        "required": [
+          "schemaVersion",
+          "issuer",
+          "jobId",
+          "testedTarget",
+          "deployment",
+          "testedAt",
+          "completedAt",
+          "seloVersion",
+          "verdict",
+          "inconclusiveReason",
+          "checks",
+          "expectedContractSha256",
+          "targetChallengeSha256",
+          "payments",
+          "evidenceSha256",
+          "evidence"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "string",
+            "const": "selo.release.v1"
+          },
+          "issuer": {
+            "type": "string",
+            "description": "Origin of the Selo deployment that signed, `https://api.useselo.xyz`."
+          },
+          "jobId": {
+            "type": "string",
+            "pattern": "^job_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "testedTarget": {
+            "type": "object",
+            "required": [
+              "url",
+              "method"
+            ],
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "method": {
+                "$ref": "#/components/schemas/HttpMethod"
+              }
+            }
+          },
+          "deployment": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "required": [
+              "id",
+              "verification"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9._-]{1,128}$"
+              },
+              "verification": {
+                "type": "string",
+                "const": "asserted_by_client"
+              }
+            },
+            "description": "The `deploymentId` you sent, or `null`."
+          },
+          "testedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "seloVersion": {
+            "type": "string",
+            "description": "Git commit of the Selo build, or `unknown`."
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/Verdict"
+          },
+          "inconclusiveReason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InconclusiveReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttestedCheck"
+            }
+          },
+          "expectedContractSha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of the canonical JSON of the `expected` contract, or `null` when none was sent."
+          },
+          "targetChallengeSha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of the target's 402 challenge Selo recorded."
+          },
+          "payments": {
+            "type": "object",
+            "required": [
+              "network",
+              "asset",
+              "inboundTxId",
+              "inboundAmountUsdc",
+              "downstream"
+            ],
+            "properties": {
+              "network": {
+                "type": "string",
+                "description": "CAIP-2 network ID."
+              },
+              "asset": {
+                "type": "string",
+                "description": "USDC asset ID."
+              },
+              "inboundTxId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "inboundAmountUsdc": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/DecimalAmount"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "downstream": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AttestedPayment"
+                }
+              }
+            }
+          },
+          "evidenceSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of the canonical JSON of `evidence`."
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttestedEvidence"
+            },
+            "description": "Every evidence record of the job, sorted by ID."
+          }
+        }
+      },
+      "AttestationSignature": {
+        "type": "object",
+        "required": [
+          "algorithm",
+          "keyId",
+          "value"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "const": "Ed25519"
+          },
+          "keyId": {
+            "type": "string",
+            "pattern": "^selo-ed25519-[0-9a-f]{16}$",
+            "description": "Matches a `keyId` in the attestation key set."
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "description": "Ed25519 signature over the UTF-8 bytes of the payload's canonical JSON, base64url without padding."
+          }
+        }
+      },
+      "ReleaseAttestation": {
+        "type": "object",
+        "description": "Ed25519-signed statement of the verdict. Present when the Selo deployment has a signing key.",
+        "required": [
+          "payload",
+          "signature"
+        ],
+        "properties": {
+          "payload": {
+            "$ref": "#/components/schemas/AttestationPayload"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/AttestationSignature"
+          }
+        }
+      },
+      "AttestationKey": {
+        "type": "object",
+        "required": [
+          "keyId",
+          "algorithm",
+          "publicKey"
+        ],
+        "properties": {
+          "keyId": {
+            "type": "string",
+            "pattern": "^selo-ed25519-[0-9a-f]{16}$",
+            "description": "`selo-ed25519-` plus the first 16 hex characters of the SHA-256 of the raw public key."
+          },
+          "algorithm": {
+            "type": "string",
+            "const": "Ed25519"
+          },
+          "publicKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$",
+            "description": "Raw 32-byte Ed25519 public key, base64url (the JWK `x` value)."
+          }
+        }
+      },
+      "AttestationKeySet": {
+        "type": "object",
+        "required": [
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttestationKey"
+            },
+            "description": "Empty when the deployment has no signing key."
+          }
+        }
+      },
+      "ReportScenario": {
+        "type": "object",
+        "required": [
+          "check",
+          "operationId",
+          "status",
+          "attempts",
+          "durationMs",
+          "failureCode"
+        ],
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/CheckId"
+          },
+          "operationId": {
+            "type": "string",
+            "description": "Immutable operation ID, `<jobId>:<check id>`. The replay reuses the paid request's operation ID as its `Idempotency-Key`."
+          },
+          "status": {
+            "$ref": "#/components/schemas/ScenarioStatus"
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "durationMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "failureCode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The check's code when it did not PASS, otherwise `null`."
+          }
+        }
+      },
+      "ReportPayment": {
+        "type": "object",
+        "required": [
+          "status",
+          "amountUsdc",
+          "txId",
+          "expectedTxId"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/PaymentStatus"
+          },
+          "amountUsdc": {
+            "$ref": "#/components/schemas/DecimalAmount"
+          },
+          "txId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Settled transaction ID."
+          },
+          "expectedTxId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ID of the transaction Selo signed, recorded before sending, used to reconcile an unresolved payment."
+          }
+        }
+      },
+      "ReportObservedResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "contentType",
+          "bodySha256",
+          "bodyBytes",
+          "txId",
+          "requestedAt"
+        ],
+        "properties": {
+          "status": {
+            "type": "integer"
+          },
+          "contentType": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bodySha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 hex of the paid response body."
+          },
+          "bodyBytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "txId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Settlement transaction the target reported and Selo accepted."
+          },
+          "requestedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "ReleaseReport": {
+        "type": "object",
+        "description": "The private report of a finished release test.",
+        "required": [
+          "jobId",
+          "project",
+          "target",
+          "testedAt",
+          "completedAt",
+          "seloVersion",
+          "verdict",
+          "inconclusiveReason",
+          "checks",
+          "warnings",
+          "failureCodes",
+          "targetChallengeSha256",
+          "expected",
+          "observedResponse",
+          "money",
+          "scenarios"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string",
+            "pattern": "^job_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "project": {
+            "type": "string",
+            "description": "Project name from the authorization."
+          },
+          "target": {
+            "type": "object",
+            "required": [
+              "url",
+              "method"
+            ],
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "method": {
+                "$ref": "#/components/schemas/HttpMethod"
+              }
+            }
+          },
+          "testedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "seloVersion": {
+            "type": "string"
+          },
+          "verdict": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Verdict"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "inconclusiveReason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InconclusiveReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckResult"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "failureCodes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Codes of every check that is FAIL or INCONCLUSIVE."
+          },
+          "targetChallengeSha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "expected": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ExpectedContract"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "observedResponse": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReportObservedResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "money": {
+            "type": "object",
+            "required": [
+              "inboundTxId",
+              "downstreamSpendUsdc",
+              "unresolvedSpendUsdc",
+              "downstreamTxIds",
+              "payments"
+            ],
+            "properties": {
+              "inboundTxId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "downstreamSpendUsdc": {
+                "$ref": "#/components/schemas/DecimalAmount"
+              },
+              "unresolvedSpendUsdc": {
+                "type": "string",
+                "pattern": "^[0-9]+\\.[0-9]{2,6}$",
+                "description": "USDC held because a payment outcome is unknown."
+              },
+              "downstreamTxIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "payments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ReportPayment"
+                }
+              }
+            }
+          },
+          "scenarios": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReportScenario"
+            }
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok"
+          }
+        }
+      },
+      "AgentCard": {
+        "type": "object",
+        "description": "Agent card describing Selo and its one skill.",
+        "required": [
+          "name",
+          "description",
+          "url",
+          "iconUrl",
+          "version",
+          "provider",
+          "capabilities",
+          "defaultInputModes",
+          "defaultOutputModes",
+          "skills"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "iconUrl": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "object",
+            "properties": {
+              "organization": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          },
+          "capabilities": {
+            "type": "object"
+          },
+          "defaultInputModes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "defaultOutputModes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "X402PaymentRequirement": {
+        "type": "object",
+        "description": "One payment option of an x402 v2 challenge.",
+        "required": [
+          "scheme",
+          "network",
+          "amount",
+          "asset",
+          "payTo",
+          "maxTimeoutSeconds"
+        ],
+        "properties": {
+          "scheme": {
+            "type": "string",
+            "description": "`exact`."
+          },
+          "network": {
+            "type": "string",
+            "description": "CAIP-2 network ID; `algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=` is Algorand Mainnet."
+          },
+          "amount": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Price in atomic units (micro-USDC). `1000000` is 1.00 USDC."
+          },
+          "asset": {
+            "type": "string",
+            "description": "Algorand asset ID of USDC, `31566704` on Mainnet."
+          },
+          "payTo": {
+            "type": "string",
+            "description": "Algorand address that receives the payment."
+          },
+          "maxTimeoutSeconds": {
+            "type": "integer"
+          },
+          "extra": {
+            "type": "object",
+            "description": "`name` and `decimals` of the asset, `tag` (`x402-global-challenge`), and the facilitator's `feePayer` address.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "X402PaymentRequired": {
+        "type": "object",
+        "description": "Decoded content of the `PAYMENT-REQUIRED` header (base64 JSON, x402 version 2).",
+        "required": [
+          "x402Version",
+          "resource",
+          "accepts"
+        ],
+        "properties": {
+          "x402Version": {
+            "type": "integer",
+            "const": 2
+          },
+          "error": {
+            "type": "string",
+            "description": "`Payment required` when no payment was sent; otherwise why the payment was refused, for example `No matching payment requirements`."
+          },
+          "resource": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "mimeType": {
+                "type": "string"
+              },
+              "serviceName": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "iconUrl": {
+                "type": "string"
+              }
+            }
+          },
+          "accepts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/X402PaymentRequirement"
+            }
+          },
+          "extensions": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "`bazaar` discovery metadata (input example and schema, output example) and `x402-merchant` information."
+          }
+        },
+        "example": {
+          "x402Version": 2,
+          "error": "Payment required",
+          "resource": {
+            "url": "https://api.useselo.xyz/v1/release-test",
+            "description": "Run an authorized x402 release test. Selo settles the request, pays the target endpoint, verifies payment and response behavior, and returns an evidence-backed PASS, FAIL, or INCONCLUSIVE report.",
+            "mimeType": "application/json",
+            "serviceName": "Selo",
+            "tags": [
+              "x402-global-challenge"
+            ],
+            "iconUrl": "https://useselo.xyz/brand/selo-logo-512.png"
+          },
+          "accepts": [
+            {
+              "scheme": "exact",
+              "network": "algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=",
+              "amount": "1000000",
+              "asset": "31566704",
+              "payTo": "N37HMJCB4BAITC2ZU7C4XW7PUMCO4T3TUASHQEL6A4EWMLOTTHOB7IOOKY",
+              "maxTimeoutSeconds": 300,
+              "extra": {
+                "name": "USDC",
+                "decimals": 6,
+                "tag": "x402-global-challenge",
+                "feePayer": "ZMFK2OI7ZBD2U27ISERZC4S6LKM6WMFJPZQ4MYNJDZ2VNBNMBA67RA22AA"
+              }
+            }
+          ],
+          "extensions": {
+            "bazaar": {
+              "info": {
+                "input": {
+                  "type": "http",
+                  "bodyType": "json",
+                  "body": {
+                    "preflightId": "pfl_01J8Z3K6W2Q9V4N7T5R8M3X1CY",
+                    "profile": "quick",
+                    "expected": {
+                      "status": 200,
+                      "contentType": "application/json"
+                    }
+                  },
+                  "method": "POST"
+                },
+                "output": {
+                  "type": "json",
+                  "example": {
+                    "jobId": "job_EXAMPLE_JOB_ID",
+                    "verdict": "PASS",
+                    "target": "https://api.example.com/v1/quote",
+                    "checks": [
+                      {
+                        "id": "handshake",
+                        "status": "PASS",
+                        "code": "HANDSHAKE_VALID",
+                        "blocking": true,
+                        "summary": "Example: the unpaid request returned a valid x402 v2 challenge.",
+                        "evidence": [
+                          "evd_EXAMPLE_HANDSHAKE"
+                        ]
+                      },
+                      {
+                        "id": "paid_delivery",
+                        "status": "PASS",
+                        "code": "PAID_AND_DELIVERED",
+                        "blocking": true,
+                        "summary": "Example: the downstream payment settled and the target returned 200.",
+                        "evidence": [
+                          "evd_EXAMPLE_PAID_RESPONSE",
+                          "evd_EXAMPLE_DOWNSTREAM_PAYMENT"
+                        ]
+                      },
+                      {
+                        "id": "response_contract",
+                        "status": "PASS",
+                        "code": "CONTRACT_MATCHED",
+                        "blocking": true,
+                        "summary": "Example: the paid response matched status 200 and content type application/json.",
+                        "evidence": [
+                          "evd_EXAMPLE_PAID_RESPONSE"
+                        ]
+                      },
+                      {
+                        "id": "discovery_contract",
+                        "status": "PASS",
+                        "code": "DISCOVERY_CONSISTENT",
+                        "blocking": true,
+                        "summary": "Example: the live challenge and the catalog record agree.",
+                        "evidence": [
+                          "evd_EXAMPLE_DISCOVERY"
+                        ]
+                      },
+                      {
+                        "id": "retry_safety",
+                        "status": "PASS",
+                        "code": "PASS_REPLAY_REJECTED",
+                        "blocking": true,
+                        "summary": "Example: replaying the identical signed payment was rejected with status 402.",
+                        "evidence": [
+                          "evd_EXAMPLE_REPLAY"
+                        ]
+                      }
+                    ],
+                    "warnings": [],
+                    "inconclusiveReason": null,
+                    "money": {
+                      "seloInboundTxId": "EXAMPLE_INBOUND_TXID",
+                      "downstreamSpendUsdc": "0.01",
+                      "downstreamTxIds": [
+                        "EXAMPLE_DOWNSTREAM_TXID"
+                      ]
+                    },
+                    "reportUrl": "https://selo.example/v1/reports/EXAMPLE_REPORT_TOKEN"
+                  }
+                }
+              },
+              "schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "input": {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string",
+                        "const": "http"
+                      },
+                      "method": {
+                        "type": "string",
+                        "enum": [
+                          "POST"
+                        ]
+                      },
+                      "bodyType": {
+                        "type": "string",
+                        "enum": [
+                          "json",
+                          "form-data",
+                          "text"
+                        ]
+                      },
+                      "body": {
+                        "type": "object",
+                        "properties": {
+                          "preflightId": {
+                            "type": "string",
+                            "description": "Id returned by POST /v1/preflight"
+                          },
+                          "profile": {
+                            "type": "string",
+                            "enum": "[depth limit]"
+                          },
+                          "expected": {
+                            "type": "object",
+                            "properties": "[depth limit]",
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "preflightId",
+                          "profile"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "method",
+                      "bodyType",
+                      "body"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "output": {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string"
+                      },
+                      "example": {
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "required": [
+                  "input"
+                ]
+              }
+            },
+            "x402-merchant": {
+              "info": {
+                "name": "Selo",
+                "website": "https://useselo.xyz",
+                "logo": "https://useselo.xyz/brand/selo-logo-512.png",
+                "categories": [
+                  "x402",
+                  "algorand",
+                  "developer-tools",
+                  "testing",
+                  "x402-global-challenge"
+                ]
+              },
+              "schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "website": {
+                    "type": "string"
+                  },
+                  "logo": {
+                    "type": "string"
+                  },
+                  "categories": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "X402SettleResponse": {
+        "type": "object",
+        "description": "Decoded content of the `PAYMENT-RESPONSE` header (base64 JSON).",
+        "required": [
+          "success",
+          "transaction",
+          "network"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "transaction": {
+            "type": "string",
+            "description": "Settlement transaction ID; empty when nothing settled."
+          },
+          "network": {
+            "type": "string"
+          },
+          "payer": {
+            "type": "string"
+          },
+          "errorReason": {
+            "type": "string"
+          },
+          "errorMessage": {
+            "type": "string"
+          },
+          "amount": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "responses": {
+      "PayloadTooLarge": {
+        "description": "The request body is larger than 64 KiB (65536 bytes).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "PAYLOAD_TOO_LARGE": {
+                "summary": "Body over 64 KiB",
+                "value": {
+                  "error": "PAYLOAD_TOO_LARGE",
+                  "message": "Request body exceeds 65536 bytes"
+                }
+              }
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Unexpected server error.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "INTERNAL": {
+                "summary": "Unexpected server error",
+                "value": {
+                  "error": "INTERNAL",
+                  "message": "Internal server error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

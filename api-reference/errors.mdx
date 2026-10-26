@@ -1,0 +1,176 @@
+---
+title: "Errors and reason codes"
+description: "Every error code the Selo API returns, with its HTTP status, and every reason code you can find in a preflight, a check or a verdict."
+icon: "triangle-exclamation"
+sidebarTitle: "Errors and reasons"
+---
+
+Selo reports problems with stable, upper-case codes. This page lists every error code the API can return, then the reason codes that appear inside successful responses: preflight rejections, INCONCLUSIVE reasons, spend denials, check statuses and retry outcomes.
+
+## Error body
+
+Every failed request returns JSON with two fields:
+
+```json Error body
+{
+  "error": "PREFLIGHT_EXPIRED",
+  "message": "Preflight pfl_… has expired; run a new preflight"
+}
+```
+
+<ResponseField name="error" type="string" required>
+  Stable machine-readable code. Branch on this field.
+</ResponseField>
+
+<ResponseField name="message" type="string" required>
+  Human-readable explanation. Its wording can change; do not parse it. For `VALIDATION_FAILED` it names the field at fault.
+</ResponseField>
+
+Some errors on `POST /v1/release-test` add fields after a job exists:
+
+| Code | Extra fields |
+| --- | --- |
+| `JOB_IN_PROGRESS` | `jobId`, when the matching job is already known |
+| `JOB_TERMINAL` | `jobId`, `status` (the job status), `inconclusiveReason` |
+| `INBOUND_SETTLEMENT_UNRESOLVED` | `jobId`, `txId` (the settlement transaction if the facilitator reported one, otherwise `null`) |
+| `INBOUND_RECORD_FAILED` | `jobId` |
+| `INTERNAL` (after your payment settled) | `jobId` |
+
+Two responses do not use this body:
+
+- **`402` on the paid route.** The body is `{}`. The information is in the `PAYMENT-REQUIRED` header, or in `PAYMENT-RESPONSE` when settlement failed. See [The paid route and x402](/api-reference/introduction#the-paid-route-and-x402).
+- **An ineligible preflight.** `POST /v1/preflight` returns `{ "eligible": false, "preflightId", "reason", "message" }`. See [Preflight rejection reasons](#preflight-rejection-reasons).
+
+## Error codes
+
+| Code | Status | Endpoints | When |
+| --- | --- | --- | --- |
+| `VALIDATION_FAILED` | `400` | All `POST` routes | The body is not JSON, has an unknown or missing field, or breaks a constraint. On the paid route also: a malformed `Idempotency-Key`, or an `expected` contract that does not compile (status outside 100 to 599, a `contentType` that is not `type/subtype`, a `jsonSchema` over 16 KiB or rejected by the schema compiler) |
+| `TARGET_URL_INVALID` | `400` | `POST /v1/authorizations` | `targetUrl` is not an absolute URL, or carries a user name or password |
+| `TARGET_NOT_HTTPS` | `400` | `POST /v1/authorizations` | `targetUrl` is not `https` |
+| `TARGET_ADDRESS_BLOCKED` | `400` | `POST /v1/authorizations` | The hostname is an IP literal, a single-label name such as `localhost`, or a name ending in `.localhost`, `.local`, `.internal`, `.home.arpa` or `.lan`; or the URL sets a non-default port |
+| `TARGET_URL_INVALID` | `422` | `POST /v1/authorizations/{id}/verify` | Selo refused to fetch the verification file: a redirect pointed to an invalid URL |
+| `TARGET_NOT_HTTPS` | `422` | `POST /v1/authorizations/{id}/verify` | Selo refused to fetch the verification file: a redirect left `https` |
+| `TARGET_ADDRESS_BLOCKED` | `422` | `POST /v1/authorizations/{id}/verify` | Selo refused to fetch the verification file: the hostname resolves to a non-public address |
+| `ORIGIN_NOT_ALLOWED` | `422` | `POST /v1/authorizations/{id}/verify` | A redirect pointed to another origin |
+| `TOO_MANY_REDIRECTS` | `422` | `POST /v1/authorizations/{id}/verify` | More than 3 redirects |
+| `AUTHORIZATION_INVALID` | `403` | `POST /v1/release-test` | The preflight's authorization is no longer verified and unexpired |
+| `NOT_FOUND` | `404` | Any | No route matches the method and path; or the authorization, preflight or report does not exist (a malformed ID or token counts as not found) |
+| `PREFLIGHT_NOT_FOUND` | `404` | `POST /v1/release-test` | `preflightId` does not name a preflight |
+| `VERIFICATION_FAILED` | `409` | `POST /v1/authorizations/{id}/verify` | The verification file answered with a non-2xx status, is larger than 4096 bytes, or has no line equal to `expectedContent` |
+| `CHALLENGE_EXPIRED` | `409` | `POST /v1/authorizations/{id}/verify` | The authorization was never verified and its one-hour challenge expired. Create a new one |
+| `AUTHORIZATION_EXPIRED` | `409` | `POST /v1/authorizations/{id}/verify` | The authorization was verified and has since lapsed. Create a new one |
+| `AUTHORIZATION_REVOKED` | `409` | `POST /v1/authorizations/{id}/verify` | The authorization was revoked |
+| `PREFLIGHT_EXPIRED` | `409` | `POST /v1/release-test` | The preflight is older than 15 minutes. Run a new one |
+| `JOB_IN_PROGRESS` | `409` | `POST /v1/release-test` | A request with the same idempotency identity is still being claimed or run. Retry shortly to fetch its result |
+| `JOB_TERMINAL` | `409` | `POST /v1/release-test` | The matching job finished without a report. Start a new preflight to retest |
+| `PAYLOAD_TOO_LARGE` | `413` | Any | The request body is larger than 64 KiB (65536 bytes) |
+| `PREFLIGHT_INELIGIBLE` | `422` | `POST /v1/release-test` | The preflight was stored as ineligible; the message names its reason |
+| `PRICE_OVER_BUDGET` | `422` | `POST /v1/release-test` | The target's price is above the per-job downstream limit (0.50 USDC) |
+| `INBOUND_RECORD_FAILED` | `500` | `POST /v1/release-test` | Your payment settled but Selo could not record it. The job does not run and is flagged for reconciliation |
+| `INTERNAL` | `500` | Any | Unexpected server error. With a `jobId` on the paid route, it happened after your payment settled: the job is recorded as INCONCLUSIVE or flagged for reconciliation |
+| `FACILITATOR_UNAVAILABLE` | `502` | `POST /v1/release-test` | The facilitator could not verify the payment. Nothing was charged |
+| `INBOUND_SETTLEMENT_UNRESOLVED` | `502` | `POST /v1/release-test` | The facilitator did not confirm the settlement outcome. The job is held for reconciliation and does not run. Do not pay again for this request |
+| `VERIFICATION_UNREACHABLE` | `502` | `POST /v1/authorizations/{id}/verify` | The verification file could not be fetched: timeout (10 seconds) or network error |
+
+<Note>
+On `POST /v1/release-test`, every `400`, `403`, `404`, `409` (`PREFLIGHT_EXPIRED`) and `422` is returned before Selo asks for payment, so you never pay for a request that cannot run.
+</Note>
+
+### What to do
+
+| Code | Next step |
+| --- | --- |
+| `VALIDATION_FAILED` | Fix the field named in `message` and resend |
+| `TARGET_URL_INVALID`, `TARGET_NOT_HTTPS`, `TARGET_ADDRESS_BLOCKED`, `ORIGIN_NOT_ALLOWED`, `TOO_MANY_REDIRECTS` | Use a public `https` hostname on the default port and serve the verification file on that origin without redirects to another origin |
+| `VERIFICATION_FAILED` | Check that `https://<origin>/.well-known/selo-verification.txt` returns `200` and contains the exact `expectedContent` line, then verify again |
+| `CHALLENGE_EXPIRED`, `AUTHORIZATION_EXPIRED`, `AUTHORIZATION_REVOKED`, `AUTHORIZATION_INVALID` | Create and verify a new authorization, then run a new preflight |
+| `PREFLIGHT_EXPIRED`, `PREFLIGHT_INELIGIBLE`, `PREFLIGHT_NOT_FOUND`, `JOB_TERMINAL` | Run a new preflight |
+| `PRICE_OVER_BUDGET` | Lower the endpoint's price to 0.50 USDC or less |
+| `JOB_IN_PROGRESS` | Resend the identical request with the same `Idempotency-Key` after a short wait |
+| `FACILITATOR_UNAVAILABLE` | Retry later; nothing was charged |
+| `INBOUND_SETTLEMENT_UNRESOLVED`, `INBOUND_RECORD_FAILED` | Do not pay again. Keep the `jobId` and the transaction ID; see [Held payments and reconciliation](/concepts/reconciliation) |
+| `VERIFICATION_UNREACHABLE`, `INTERNAL` | Retry; if it persists, check the target's availability |
+
+## Preflight rejection reasons
+
+An ineligible preflight returns `eligible: false` with one of these reasons. `POST /v1/preflight` maps each reason to an HTTP status. `GET /v1/preflight/{preflightId}` returns a stored ineligible preflight with `200`.
+
+| Reason | Status | When |
+| --- | --- | --- |
+| `AUTHORIZATION_MISSING` | `403` | The authorization ID is unknown or malformed (`preflightId` is `null`), or the authorization does not cover this exact origin, path and method |
+| `AUTHORIZATION_EXPIRED` | `403` | The authorization is not `VERIFIED`, or has lapsed |
+| `TARGET_URL_INVALID` | `400` | `targetUrl` is not an absolute URL, or carries a user name or password. `preflightId` is `null` |
+| `TARGET_NOT_HTTPS` | `400` | `targetUrl` is not `https`. `preflightId` is `null` |
+| `TARGET_ADDRESS_BLOCKED` | `422` | The hostname is an IP literal or a private name, or the URL sets a non-default port (`preflightId` is `null`); or the hostname resolves to a non-public address when Selo probes it |
+| `METHOD_NOT_ALLOWED` | `422` | Defined in the contract; the current API does not return it |
+| `TARGET_UNREACHABLE` | `422` | The unpaid request timed out (10 seconds), failed on the network, or got a `5xx` |
+| `NO_PAYMENT_CHALLENGE` | `422` | The unpaid request did not get a `402`, or the `402` has no valid x402 v2 `PAYMENT-REQUIRED` challenge, an unparseable price or an invalid `payTo`. Redirects are not followed, so a `3xx` lands here |
+| `NETWORK_NOT_SUPPORTED` | `422` | The challenge offers no `exact` payment on the Algorand network Selo pays on |
+| `ASSET_NOT_SUPPORTED` | `422` | The challenge offers `exact` on that network, but not in USDC |
+| `PRICE_OVER_BUDGET` | `422` | The price is above the per-job downstream limit (0.50 USDC) |
+
+See [Run a preflight](/guides/preflight).
+
+## INCONCLUSIVE reasons
+
+A job that ends INCONCLUSIVE carries one `inconclusiveReason`. PASS and FAIL carry `null`, because a proven blocking FAIL always wins. When several reasons apply, the first one recorded wins, except `PAYMENT_UNRESOLVED`, which replaces any other.
+
+| Reason | When |
+| --- | --- |
+| `NETWORK_UNAVAILABLE` | A request to the target failed on the network (unpaid request, paid request, reading the paid body or the replay), the paid request could not be sent, the target's address was blocked at run time, or Selo could not read its own wallet balance |
+| `FACILITATOR_UNAVAILABLE` | The Bazaar catalog could not be reached for the `discovery_contract` check. A paid request whose own settlement outcome is unknown is also held under this reason, without a report |
+| `TARGET_TIMEOUT` | The 60-second job wall clock ran out, or a request to the target or the read of its paid body timed out |
+| `BUDGET_EXHAUSTED` | The spend guard refused the payment with `SCENARIO_BUDGET_EXCEEDED`, `JOB_BUDGET_EXCEEDED` or `ABSOLUTE_CAP_EXCEEDED` |
+| `PAYMENT_UNRESOLVED` | The outcome of Selo's payment to the target is unknown, so the amount is held as unresolved and spending stops. Also the spend guard reason `PAYMENT_UNRESOLVED` |
+| `EVIDENCE_INCOMPLETE` | A blocking check is INCONCLUSIVE, is missing, or claims PASS without evidence, and no other reason was recorded. Also: the paid body was larger than 256 KiB, or the target's live requirement could not be paid as offered |
+| `AUTHORIZATION_LAPSED` | The authorization was no longer verified, had expired or no longer matched the origin when the job started or before paying (spend guard `AUTHORIZATION_INVALID`, `AUTHORIZATION_EXPIRED`, `ORIGIN_NOT_AUTHORIZED`) |
+| `INTERNAL_ERROR` | Selo failed unexpectedly, its operating wallet could not cover the payment, the spend guard returned `JOB_NOT_RUNNING`, `NETWORK_NOT_ALLOWED` or `ASSET_NOT_ALLOWED`, or the job was interrupted by a restart |
+
+See [Verdicts and the gate](/concepts/verdicts).
+
+## Spend denial reasons
+
+Before Selo signs a payment to your endpoint, the spend guard evaluates these rules in order and stops at the first that fails. A denial makes the `paid_delivery` check INCONCLUSIVE with code `SPEND_GUARD_DENIED` and the summary `The spend guard denied the downstream payment: <reason>.`
+
+| Reason | Fails when | Job becomes INCONCLUSIVE with |
+| --- | --- | --- |
+| `AUTHORIZATION_INVALID` | The authorization is not `VERIFIED` | `AUTHORIZATION_LAPSED` |
+| `AUTHORIZATION_EXPIRED` | The authorization has expired | `AUTHORIZATION_LAPSED` |
+| `JOB_NOT_RUNNING` | The job is not in the `RUNNING` state | `INTERNAL_ERROR` |
+| `ORIGIN_NOT_AUTHORIZED` | The payment's origin differs from the authorized origin | `AUTHORIZATION_LAPSED` |
+| `NETWORK_NOT_ALLOWED` | The payment is not on Selo's network | `INTERNAL_ERROR` |
+| `ASSET_NOT_ALLOWED` | The payment is not in USDC | `INTERNAL_ERROR` |
+| `PAYMENT_UNRESOLVED` | An earlier payment of the job is unresolved | `PAYMENT_UNRESOLVED` |
+| `SCENARIO_BUDGET_EXCEEDED` | The amount alone is above the scenario budget, which equals the job's maximum | `BUDGET_EXHAUSTED` |
+| `JOB_BUDGET_EXCEEDED` | Settled + reserved + unresolved + this amount would exceed the job's maximum (0.50 USDC) | `BUDGET_EXHAUSTED` |
+| `ABSOLUTE_CAP_EXCEEDED` | The job's maximum is above the absolute cap (5.00 USDC) | `BUDGET_EXHAUSTED` |
+
+See [Payments and spend limits](/concepts/payments).
+
+## Check statuses
+
+Each of the five checks reports one status. Every check in the `quick` profile is blocking.
+
+| Status | Meaning | Effect on the verdict |
+| --- | --- | --- |
+| `PASS` | The check held, with evidence | Needed on all five checks for a PASS. A PASS without evidence counts as INCONCLUSIVE |
+| `WARN` | A concern that does not block | Listed in `warnings` as `<check id>: <summary>` |
+| `FAIL` | The check failed, with evidence | Makes the verdict FAIL |
+| `INCONCLUSIVE` | Selo could not decide; a check that never ran is INCONCLUSIVE with code `NOT_RUN` | Makes the verdict INCONCLUSIVE unless another check FAILs |
+
+The verdict rule: any blocking FAIL with evidence gives FAIL; otherwise any blocking INCONCLUSIVE, missing check, or PASS without evidence gives INCONCLUSIVE; otherwise PASS. The codes each check can return are listed in [The five release checks](/concepts/checks).
+
+## Retry outcomes
+
+The `retry_safety` check replays the identical signed payment once. Its `code` is one of these outcomes.
+
+| Outcome | Status | When |
+| --- | --- | --- |
+| `PASS_REPLAY_REJECTED` | `PASS` | The replay got a `4xx` other than `408` or `429` |
+| `PASS_SAFE_RETRY` | `PASS` | The replay got a `2xx` with the same settlement transaction as the paid request, or with no transaction and a body byte-identical to the paid response |
+| `WARN_NO_IDEMPOTENCY_CONTRACT` | `WARN` | A `GET` replay got a `2xx` with no transaction and a different body |
+| `FAIL_DUPLICATE_SIDE_EFFECT` | `FAIL` | The replay got a `2xx` with a different settlement transaction, or a `POST` replay got a `2xx` with no transaction and a different body |
+| `INCONCLUSIVE` | `INCONCLUSIVE` | The replay got `408`, `429`, a `1xx`, `3xx` or `5xx`, timed out, failed on the network, or did not run |
+
+See [The five release checks](/concepts/checks).
