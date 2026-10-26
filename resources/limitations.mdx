@@ -1,0 +1,64 @@
+---
+title: "Known limitations"
+description: "What Selo does not do yet, stated plainly, and what to do about each gap."
+icon: "triangle-exclamation"
+---
+
+Selo is a release gate with a narrow, enforced scope. These are the gaps you should know about before you rely on it, and how to work with each one.
+
+## Paying Selo needs an x402 client
+
+The site at [useselo.xyz](https://useselo.xyz) walks you through authorization and preflight, then gives you the exact commands to pay. Paying from a browser wallet is not built yet.
+
+**What to do:** use the `selo` CLI from a checkout of the repository, as in the [Quickstart](/quickstart), or any x402 client that can pay USDC on Algorand. See [Pay with any x402 client](/guides/any-x402-client).
+
+## One profile, two methods, one asset
+
+Selo runs the `quick` profile only: unpaid requests to read your `402` (one from the preflight, one from the test), one paid request and one replay. It tests `GET` and `POST` (JSON body) routes, priced at up to 0.50 USDC, paid in USDC on Algorand. Any other method, network or asset is refused before anything is paid, and the public API runs on Mainnet only.
+
+**What to do:** point Selo at a `GET` or `POST` route that offers an `exact` USDC payment on Algorand Mainnet. To experiment without Mainnet funds, run your own Selo on Algorand Testnet from the [source code](https://github.com/Enoch208/selo) and use `--network testnet`. See [Pricing and limits](/resources/pricing-and-limits).
+
+## The retry check is one replay
+
+The retry check re-sends the byte-identical payment and body once and records what your endpoint actually did. It does not prove that your endpoint is idempotent under every kind of retry.
+
+**What to do:** read a `retry_safety` PASS as "this replay was rejected or answered from a stored result without a second settlement", and keep your own idempotency tests for other retry paths. See [The five release checks](/concepts/checks).
+
+## Discovery is checked per payee
+
+Selo looks your route up among the Bazaar listings of the payee named in your live `402`. A listing that names a different payee for the same URL is not compared, and the check reads as not catalogued (`discovery_contract` WARN `NOT_CATALOGED`).
+
+**What to do:** make sure the Bazaar listing for your route names the same payTo as your live `402`. If the catalog cannot be read at all, the check is INCONCLUSIVE (`CATALOG_UNAVAILABLE`) and the run is not a PASS; run it again later.
+
+## The release id is your word
+
+`--release` (or `deploymentId` on the API) names the build you tested. Selo records it in the attestation as `asserted_by_client` and does not verify which build is actually deployed.
+
+**What to do:** pass the exact commit SHA you deploy, and promote only after `selo verify` confirms a signed PASS for that same release, URL and method. Tie the release id to your own build provenance. See [Gate deploys in GitHub Actions](/guides/github-actions).
+
+## A release test is a single long request
+
+`POST /v1/release-test` waits for your payment to settle and for Selo's downstream call before it answers. Clients and proxies in between need generous timeouts.
+
+**What to do:** the CLI already waits up to 300 seconds per request. If you use another client, or a proxy sits between you and Selo, give it a similarly generous timeout. If a request times out, do not pay again: retry with the same `Idempotency-Key`, or rerun the CLI with `--resume`. See [Recover an interrupted run](/guides/resume).
+
+## Recovery does not carry across CI runs
+
+The CLI keeps its run state in `.selo/runs/<release>.json` in the workspace. In GitHub Actions that state is not cached between workflow runs, because a cache is readable by pull requests from forks. Re-running a CI job after an unconfirmed outcome starts a new paid test, and the job says so.
+
+**What to do:** after an unconfirmed outcome in CI (exit `2`), check the payer account for the expected transaction id printed in the log before you re-run the job. On your own machine, where the run state persists, rerun the same `selo test` command with `--resume` while the preflight is still valid (15 minutes) to recover without paying again.
+
+## Held payments are reconciled by the operator
+
+Selo holds any payment whose outcome is unclear instead of guessing.
+
+- A held **downstream** payment (Selo paying your endpoint) is resolved by an operator command, only on chain proof: it settles a confirmed matching transfer, releases one that provably expired, and holds everything else. Payments signed before 26 October 2026 carry no last-valid round, so the command can settle them but never release them.
+- A held **inbound** settlement (your payment to Selo that the facilitator did not confirm) is still resolved by hand.
+
+**What to do:** if your payment to Selo is held, do not pay again. Check your payer account for the transaction id the CLI printed, and open an issue at [github.com/Enoch208/selo/issues](https://github.com/Enoch208/selo/issues) with the job id. See [Held payments and reconciliation](/concepts/reconciliation).
+
+## A short public track record
+
+The Mainnet runs with published evidence are two release tests against ORA Gate, a third-party endpoint tested with its owner's permission, and two against Selo's demo merchant. Each one, with both transactions and its evidence file, is on [Proof on Algorand Mainnet](/resources/mainnet-proof). The [claims ledger](https://github.com/Enoch208/selo/blob/main/docs/CLAIMS.md) lists what is proven and what is not yet.
+
+**What to do:** check the transactions and verify the signed verdicts yourself. If you run Selo on your own endpoint and want to share the result, the [pilot guide](https://github.com/Enoch208/selo/blob/main/docs/PILOT_GUIDE.md) explains how.

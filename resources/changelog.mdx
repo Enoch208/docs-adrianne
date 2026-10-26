@@ -1,0 +1,61 @@
+---
+title: "Changelog"
+description: "What changed in Selo, newest first, from the commit history and the claims ledger."
+icon: "clock-rotate-left"
+---
+
+Each entry lists what shipped and what was proven on Algorand Mainnet. The full history is in the [commit log](https://github.com/Enoch208/selo/commits/main) and every proven claim is in the [claims ledger](https://github.com/Enoch208/selo/blob/main/docs/CLAIMS.md).
+
+<Update label="26 October 2026" description="The release gate">
+  Selo's verdict can now stop a deploy. Built on 25 and 26 October and proven on Mainnet on 26 October.
+
+  **New**
+
+  - **The `selo` CLI.** `selo auth create | verify | status`, `selo preflight`, `selo test` and `selo verify`, with a strict exit contract: `0` PASS, `1` FAIL, `2` INCONCLUSIVE or unconfirmed, `3` refused before paying. The CLI recomputes the verdict from the report's own checks, pays once per run, never retries a payment on its own, and recovers an interrupted run with `--resume`. See [CLI overview](/cli/overview).
+  - **Signed attestations.** Every release test answer carries an Ed25519 attestation (`selo.release.v1`) of the verdict, the checks, both payment legs, the contract and `402` hashes, and an evidence manifest. Keys are published at `/.well-known/selo-attestation-keys.json`, and `selo verify` checks an attestation offline. See [Signed attestations](/concepts/attestations).
+  - **Release id.** The paid request accepts an optional `deploymentId`, stored on the job and attested as `asserted_by_client`. The CLI sends `--release` as this id.
+  - **GitHub Action.** A composite action with `preflight`, `test` and `verify` modes, and an example workflow that promotes only a verified signed PASS for the exact commit. See [Gate deploys in GitHub Actions](/guides/github-actions).
+  - **Demo merchant.** An x402 merchant at `https://demo.useselo.xyz/v1/orders` with a `broken-v1` release that is healthy and settles but breaks its receipt schema, and a `fixed-v2` release that passes. See [Try it with the demo merchant](/guides/demo-merchant).
+  - **Reconciliation command.** `pnpm --filter @selo/api reconcile` resolves held downstream payments from Algorand indexer evidence: it settles a confirmed matching transfer, releases one that provably expired, and holds everything else. Each signed downstream payment now records its last valid round. See [Held payments and reconciliation](/concepts/reconciliation).
+
+  **Fixed**
+
+  - **Discovery against the grown Bazaar catalog.** The discovery check now looks a target up among its own payee's Bazaar listings instead of reading the whole catalog.
+
+  **Proven on Mainnet**
+
+  - `broken-v1`: FAIL on `response_contract` (`SCHEMA_MISMATCH`), CLI exit 1. Selo was paid [`SVGTX3U6…`](https://allo.info/tx/SVGTX3U6XQLSGJP7L7X7KNPSDLWFBSA3JK7AFNHPWENIWP4YVIEQ), then paid the merchant [`RZR6XUIA…`](https://allo.info/tx/RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ).
+  - `fixed-v2`: PASS on all five checks, CLI exit 0. Selo was paid [`EPBEZR22…`](https://allo.info/tx/EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA), then paid the merchant [`QEUF5D33…`](https://allo.info/tx/QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ).
+  - The `Release gate demo` workflow [blocked `broken-v1`](https://github.com/Enoch208/selo/actions/runs/40308497965) and [promoted `fixed-v2`](https://github.com/Enoch208/selo/actions/runs/40308508699) after verifying the signed verdicts.
+  - The reconciliation command ran on the production ledger and found nothing unresolved.
+
+  The landing page at [useselo.xyz](https://useselo.xyz) now shows the release gate and its Mainnet proof.
+</Update>
+
+<Update label="30 September 2026" description="Retry check compares replayed bodies">
+  **Changed**
+
+  - **Retry safety compares replayed bodies.** When a replay of the identical signed payment returns a body byte-identical to the original paid response with no new settlement, the check now credits it as a safe retry (`PASS_SAFE_RETRY`). The earlier version could not tell a stored result from a second delivery.
+
+  **Proven on Mainnet**
+
+  - **ORA Gate retest: PASS on all five checks**, including discovery (`DISCOVERY_CONSISTENT`) and retry safety (`PASS_SAFE_RETRY`). Selo was paid [`M7UBNUG4…`](https://allo.info/tx/M7UBNUG4M6XAQBT7NBUFVDMCRGIK4IGYDUGLLATB5ADAS3RLMDTQ) in round 65538170, then paid ORA Gate [`S2NOVVRD…`](https://allo.info/tx/S2NOVVRDZUPTY7AA3BZ3NDISYPNXNDMXEKX442SVNR7RXQCP3W7Q).
+
+  **New**
+
+  - **Repository.** The first commits to [github.com/Enoch208/selo](https://github.com/Enoch208/selo), with the claims ledger and the evidence for every proven claim.
+  - **The site** at [useselo.xyz](https://useselo.xyz): the test flow and the report page.
+  - **Machine-readable metadata** for agents and the Bazaar: [`/llms.txt`](https://api.useselo.xyz/llms.txt) and [`/.well-known/agent-card.json`](https://api.useselo.xyz/.well-known/agent-card.json). See [Use Selo from a coding agent](/agents).
+</Update>
+
+<Update label="27 September 2026" description="Live on Algorand Mainnet">
+  **New**
+
+  - **The paid route.** `POST https://api.useselo.xyz/v1/release-test`, 1.00 USDC over x402 on Algorand Mainnet (USDC ASA `31566704`) through the GoPlausible facilitator. It verifies, claims the job, settles and records Selo's own payment before any downstream call. The route is listed in the Bazaar catalog and tagged `x402-global-challenge`.
+  - **Five release checks.** `handshake`, `paid_delivery`, `response_contract`, `discovery_contract` and `retry_safety`, reduced to a deterministic PASS, FAIL or INCONCLUSIVE verdict. See [The five release checks](/concepts/checks).
+  - **Payment identifier support** for targets that require the `payment-identifier` extension.
+
+  **Proven on Mainnet**
+
+  - **First Orchestrator round trip.** Selo was paid [`JXU2INAT…`](https://allo.info/tx/JXU2INATXUJHE7WZGGWN25BPM6L2YEL6Q7LU5W3HICI4B5CX4JAQ) in round 65454635, then paid ORA Gate, an authorized third-party x402 endpoint, [`ATF5HLYB…`](https://allo.info/tx/ATF5HLYBBY4G5GYPNLCUMC5FXH22WIXI2QG3YP7M4WYPA5EHQTYQ) in round 65454637. See [Proof on Algorand Mainnet](/resources/mainnet-proof).
+</Update>

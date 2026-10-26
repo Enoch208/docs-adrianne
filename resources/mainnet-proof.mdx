@@ -1,0 +1,106 @@
+---
+title: "Proof on Algorand Mainnet"
+sidebarTitle: "Mainnet proof"
+description: "The public record of Selo's release tests on Algorand Mainnet, with both payment legs, the verdicts and the evidence files."
+icon: "certificate"
+---
+
+Every run on this page is a real release test on Algorand Mainnet. Each one has two transactions you can check on a public explorer: the payment into Selo, then Selo's payment to the target, in that order. Each links the evidence file it was recorded in.
+
+<Info>
+  This page repeats only claims marked **PROVEN** in Selo's [claims ledger](https://github.com/Enoch208/selo/blob/main/docs/CLAIMS.md). The ledger also lists what is not proven yet. Evidence files are written by a command from a real run, never by hand, and are sanitized before they are saved.
+</Info>
+
+## Release tests
+
+| Date        | Target                                  | Release     | Verdict          | Selo was paid (1.00 USDC)                                                                                           | Selo paid the target (0.01 USDC)                                                                                    | Evidence |
+| ----------- | --------------------------------------- | ----------- | ---------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | -------- |
+| 27 Sep 2026 | ORA Gate                                | go-live     | **FAIL**         | [`JXU2INAT…4JAQ`](https://allo.info/tx/JXU2INATXUJHE7WZGGWN25BPM6L2YEL6Q7LU5W3HICI4B5CX4JAQ), round 65454635          | [`ATF5HLYB…QTYQ`](https://allo.info/tx/ATF5HLYBBY4G5GYPNLCUMC5FXH22WIXI2QG3YP7M4WYPA5EHQTYQ), round 65454637          | [go-live](https://github.com/Enoch208/selo/blob/main/docs/evidence/g2-orchestrator-roundtrip-1-go-live.json) |
+| 30 Sep 2026 | ORA Gate                                | retest      | **PASS**         | [`M7UBNUG4…MDTQ`](https://allo.info/tx/M7UBNUG4M6XAQBT7NBUFVDMCRGIK4IGYDUGLLATB5ADAS3RLMDTQ), round 65538170          | [`S2NOVVRD…3W7Q`](https://allo.info/tx/S2NOVVRDZUPTY7AA3BZ3NDISYPNXNDMXEKX442SVNR7RXQCP3W7Q)                          | [retest](https://github.com/Enoch208/selo/blob/main/docs/evidence/g2-orchestrator-roundtrip-2-retest.json) |
+| 26 Oct 2026 | Demo merchant                           | `broken-v1` | **FAIL**, exit 1 | [`SVGTX3U6…VIEQ`](https://allo.info/tx/SVGTX3U6XQLSGJP7L7X7KNPSDLWFBSA3JK7AFNHPWENIWP4YVIEQ), round 66348324          | [`RZR6XUIA…DOLQ`](https://allo.info/tx/RZR6XUIA3GTHW6ABAHUIXRDCNYYXIHQVQYGN2T5PAMDO37DDDOLQ), round 66348326          | [summary](https://github.com/Enoch208/selo/blob/main/docs/evidence/g5-release-gate-broken-v1.json) · [attestation](https://github.com/Enoch208/selo/blob/main/docs/evidence/g5-release-gate-broken-v1-attestation.json) |
+| 26 Oct 2026 | Demo merchant                           | `fixed-v2`  | **PASS**, exit 0 | [`EPBEZR22…UIJA`](https://allo.info/tx/EPBEZR22SZ5LYKFM7UJYCSFG5IWNA6QYZ6XHUA6KGTTDDQQ5UIJA), round 66349222          | [`QEUF5D33…E3ZQ`](https://allo.info/tx/QEUF5D33T4YHYP3KKIY2PGCYF55XXSUYKS5GXFBAVAZ4IEZOE3ZQ), round 66349225          | [summary](https://github.com/Enoch208/selo/blob/main/docs/evidence/g5-release-gate-fixed-v2.json) · [attestation](https://github.com/Enoch208/selo/blob/main/docs/evidence/g5-release-gate-fixed-v2-attestation.json) |
+
+## ORA Gate: go-live and retest
+
+[ORA Gate](https://ora-gate-mainnet.vercel.app/.well-known/x402) is an x402 messaging endpoint on Algorand Mainnet, priced at 0.01 USDC. It was tested at `POST https://ora-gate-mainnet.vercel.app/api/ora-gate/message/ora_agent` with its owner's permission. The owner agreed to be named.
+
+<Steps>
+  <Step title="Go-live, 27 September 2026: FAIL">
+    Job `job_GY5X6P4A3FSVXDEQ2VXP4EWAGR`. Selo was paid in round 65454635, then paid ORA Gate in round 65454637.
+
+    | Check                | Status | Code                         |
+    | -------------------- | ------ | ---------------------------- |
+    | `handshake`          | PASS   | `HANDSHAKE_VALID`            |
+    | `paid_delivery`      | PASS   | `PAID_AND_DELIVERED`         |
+    | `response_contract`  | PASS   | `CONTRACT_MATCHED`           |
+    | `discovery_contract` | WARN   | `NOT_CATALOGED`              |
+    | `retry_safety`       | FAIL   | `FAIL_DUPLICATE_SIDE_EFFECT` |
+
+    The replay returned ORA Gate's stored result without a new settlement. The version of the retry check used in this run did not compare the replayed body with the original response, so it could not tell a stored result from a second delivery and reported a possible duplicate. The owner confirmed the message was delivered once. The check was then changed to credit a byte-identical stored result as a safe retry. The original report is kept unchanged. At the time, the route was not yet listed in the Bazaar catalog, hence the discovery WARN.
+  </Step>
+  <Step title="Retest, 30 September 2026: PASS">
+    Job `job_ZP2BC5G5PD398EHYYNW90XX02W`, run after the retry check was changed to compare replayed bodies. All five checks passed, including discovery (`DISCOVERY_CONSISTENT`, consistent with the Bazaar listing) and retry safety (`PASS_SAFE_RETRY`: the replay returned a body byte-identical to the original paid response, with no new settlement).
+  </Step>
+</Steps>
+
+## Demo merchant: FAIL, fix, PASS
+
+The [demo merchant](/guides/demo-merchant) at `https://demo.useselo.xyz/v1/orders` sells an order for 0.01 USDC. It has two releases at the same URL. Its health check answered `200` both times. Both runs went through the `selo` CLI against the production API.
+
+| Check                | `broken-v1`                           | `fixed-v2`                       |
+| -------------------- | ------------------------------------- | -------------------------------- |
+| `handshake`          | PASS `HANDSHAKE_VALID`                | PASS `HANDSHAKE_VALID`           |
+| `paid_delivery`      | PASS `PAID_AND_DELIVERED`             | PASS `PAID_AND_DELIVERED`        |
+| `response_contract`  | **FAIL `SCHEMA_MISMATCH`**            | PASS `CONTRACT_MATCHED`          |
+| `discovery_contract` | INCONCLUSIVE `CATALOG_UNAVAILABLE`    | PASS `DISCOVERY_CONSISTENT`      |
+| `retry_safety`       | PASS `PASS_REPLAY_REJECTED`           | PASS `PASS_REPLAY_REJECTED`      |
+| Verdict and gate     | FAIL, gate BLOCK, exit 1              | PASS, gate ALLOW, exit 0         |
+| Job                  | `job_189NZ481HFH77CRGF60AEF22RG`      | `job_51AZ2WJZ78RF1WZC316Q1K38GG` |
+
+`broken-v1` settles its payment and answers `200`, but its receipt does not match the declared schema: `must have required property 'receiptId'`. The proven contract FAIL decides the verdict on its own. In that run the Bazaar catalog could not be read, so discovery was INCONCLUSIVE; the catalog lookup was then changed to search by payee. `fixed-v2` returns the declared receipt and passes all five checks.
+
+## GitHub Actions gate
+
+The `Release gate demo` workflow verified the two signed Mainnet verdicts above against a pinned key on GitHub on 26 October 2026.
+
+| Release     | Gate   | Promotion | Run                                                                                       |
+| ----------- | ------ | --------- | ----------------------------------------------------------------------------------------- |
+| `broken-v1` | Failed | Skipped   | [Actions run 40308497965](https://github.com/Enoch208/selo/actions/runs/40308497965)      |
+| `fixed-v2`  | Passed | Ran       | [Actions run 40308508699](https://github.com/Enoch208/selo/actions/runs/40308508699)      |
+
+See [Gate deploys in GitHub Actions](/guides/github-actions) to set up the same gate.
+
+## Verify the signed verdicts yourself
+
+Both demo merchant verdicts carry an Ed25519 attestation signed by `selo-ed25519-728fcf85650b128f`. The public key is in [`selo-attestation-keys.json`](https://github.com/Enoch208/selo/blob/main/docs/evidence/selo-attestation-keys.json) and served at `https://api.useselo.xyz/.well-known/selo-attestation-keys.json`. From a checkout of the repository, with no wallet and no payment:
+
+```bash Terminal
+pnpm selo verify --attestation docs/evidence/g5-release-gate-broken-v1-attestation.json \
+  --keys docs/evidence/selo-attestation-keys.json --release broken-v1 \
+  --url https://demo.useselo.xyz/v1/orders --method POST
+# exit 1, verdict FAIL
+
+pnpm selo verify --attestation docs/evidence/g5-release-gate-fixed-v2-attestation.json \
+  --keys docs/evidence/selo-attestation-keys.json --release fixed-v2 \
+  --url https://demo.useselo.xyz/v1/orders --method POST
+# exit 0, verdict PASS
+```
+
+Presenting the `fixed-v2` attestation as `broken-v1` exits `2`: a PASS for one release cannot unlock another. See [Verify a signed verdict](/guides/verify-attestation).
+
+## Listing and attribution
+
+Selo's own paid route is live and discoverable on Mainnet. The decoded `402` from `POST https://api.useselo.xyz/v1/release-test` shows Algorand Mainnet, USDC ASA `31566704`, Selo's payTo and the `x402-global-challenge` tag. Selo is listed in the Bazaar catalog, has a merchant record at the facilitator, and has a row under `x402-global-challenge` on the Mainnet merchant leaderboard.
+
+| Evidence                                                                                                                  | What it shows                                                     |
+| ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| [`g1-402-response.json`](https://github.com/Enoch208/selo/blob/main/docs/evidence/g1-402-response.json)                   | Selo's decoded `402` challenge                                    |
+| [`g1-bazaar-resource.json`](https://github.com/Enoch208/selo/blob/main/docs/evidence/g1-bazaar-resource.json)             | Selo's Bazaar catalog records                                     |
+| [`g1-merchant.json`](https://github.com/Enoch208/selo/blob/main/docs/evidence/g1-merchant.json)                           | The facilitator merchant record for Selo's payTo                  |
+| [`g1-leaderboard.json`](https://github.com/Enoch208/selo/blob/main/docs/evidence/g1-leaderboard.json)                     | Selo's row under `x402-global-challenge` on the leaderboard       |
+
+## Proven in the test suite
+
+Some guarantees are proven by automated tests rather than by a single Mainnet run: the spend cap under truly parallel reservations on a real PostgreSQL database, the CLI's exit contract, and reconciliation of held payments only on chain proof. The recorded run with every test name is in [`g3-test-suite.txt`](https://github.com/Enoch208/selo/blob/main/docs/evidence/g3-test-suite.txt), and the claims ledger names the tests behind each row.
+
+All evidence files and the commands that produce them are indexed in [`docs/evidence`](https://github.com/Enoch208/selo/blob/main/docs/evidence/README.md).

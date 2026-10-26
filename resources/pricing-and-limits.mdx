@@ -1,0 +1,91 @@
+---
+title: "Pricing and limits"
+description: "Every price, spend cap, time limit and size limit that applies to a Selo release test, in one place."
+icon: "coins"
+---
+
+A release test costs 1.00 USDC, paid by you to Selo. Selo pays your endpoint's price from its own wallet, up to 0.50 USDC per job. Everything else is free.
+
+## Who pays what
+
+| Payment                     | Payer                    | Payee                  | Amount                                    | When                                                                |
+| --------------------------- | ------------------------ | ---------------------- | ----------------------------------------- | ------------------------------------------------------------------- |
+| Release test                | You (your payer wallet)  | Selo                   | 1.00 USDC                                 | Once per release test, over x402 on `POST /v1/release-test`         |
+| Your endpoint's price       | Selo (its own wallet)    | Your endpoint's payTo  | Your price, at most 0.50 USDC             | Once per release test, after Selo's own payment has settled         |
+| Authorization               | none                     | none                   | Free                                      | `POST /v1/authorizations` and its verify call                       |
+| Preflight                   | none                     | none                   | Free                                      | `POST /v1/preflight`                                                |
+| Report, keys, discovery     | none                     | none                   | Free                                      | `GET /v1/reports/:token`, `/.well-known/…`, `/llms.txt`             |
+
+The replay in the retry check re-sends the payment Selo already made. It is not a second payment from Selo; a correct endpoint rejects it or returns its stored result without settling again.
+
+## Prices and spend caps
+
+These are the values on the public API at `https://api.useselo.xyz`. They are also the defaults in `apps/api/src/env.ts` for anyone running Selo themselves.
+
+| Limit                         | Value         | Setting                          | What happens at the limit                                                                                                                         |
+| ----------------------------- | ------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Selo's price                  | 1.00 USDC     | `SELO_TEST_PRICE_USDC`           | The amount in Selo's `402` (`"amount": "1000000"` in micro-USDC)                                                                                  |
+| Target price budget per job   | 0.50 USDC     | `SELO_JOB_MAX_SPEND_USDC`        | A target priced higher is refused by the preflight with `PRICE_OVER_BUDGET`, and the paid route refuses it with `422 PRICE_OVER_BUDGET` before charging |
+| Absolute cap                  | 5.00 USDC     | `SELO_ABSOLUTE_MAX_SPEND_USDC`   | No job budget can exceed it. The server refuses to start with a higher value, and a database CHECK constraint enforces it                          |
+
+Before every downstream signature Selo checks:
+
+```text
+settled + reserved + unresolved + amount  ≤  job budget  ≤  5.00 USDC
+```
+
+The check is one conditional database update in the same transaction that records the payment, so parallel attempts cannot overspend. An amount whose outcome is unclear stays counted as `unresolved` and blocks every later reservation. See [Payments and spend limits](/concepts/payments).
+
+## Time limits
+
+| Limit                              | Value        | Notes                                                                                                   |
+| ---------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------- |
+| Verification challenge             | 1 hour       | Verify a new `auth create` challenge within an hour, or it expires with `CHALLENGE_EXPIRED`              |
+| Authorization                      | 24 hours     | Counted from verification (`AUTHORIZATION_TTL_HOURS`). Rechecked before the first probe and before the replay |
+| Preflight                          | 15 minutes   | `PREFLIGHT_TTL_MINUTES`. An expired preflight is refused with `409 PREFLIGHT_EXPIRED`. `selo test` runs a fresh one on every run |
+| Job wall clock                     | 60 seconds   | `JOB_WALL_CLOCK_MS`. Checks that cannot finish in time end INCONCLUSIVE with `TARGET_TIMEOUT`            |
+| Handshake request to your endpoint | 10 seconds   | The unpaid request that reads your `402`                                                                |
+| Paid request and replay            | 20 seconds each | The paid request to your endpoint and the replay                                                    |
+| `selo` CLI request timeout         | 300 seconds  | Per request from the CLI to Selo. A release test waits for settlement and the downstream call           |
+| Recovering with `--resume`         | 15 minutes   | `--resume` reuses the same preflight, so it works while that preflight is valid                          |
+
+## Size limits
+
+| Limit                                   | Value                   | What happens over the limit                                                           |
+| --------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------- |
+| JSON request body to the Selo API       | 64 KiB                  | `413 PAYLOAD_TOO_LARGE`                                                               |
+| Preflight `requestBody`                 | 16 KiB, serialized      | `400 VALIDATION_FAILED`. Allowed only with `POST`, and must not be `null`             |
+| `/.well-known/selo-verification.txt`    | 4,096 bytes             | Verification fails with `VERIFICATION_FAILED`                                         |
+| Paid response body Selo reads           | 256 KiB                 | `response_contract` is INCONCLUSIVE with `BODY_TOO_LARGE`                              |
+| CLI `--contract` and `--body` files     | 64 KiB each             | The CLI exits `3` before paying                                                       |
+| `targetUrl`                             | 2,048 characters        | `400 VALIDATION_FAILED`                                                               |
+| `project` / `contact` on an authorization | 1–80 / 3–200 characters | `400 VALIDATION_FAILED`                                                             |
+| Release id (`--release`, `deploymentId`) | 1–128 characters of `A-Z a-z 0-9 . _ -` | The CLI exits `3`; the API answers `400 VALIDATION_FAILED`        |
+| `Idempotency-Key` header on the paid route | 8–128 characters of `A-Z a-z 0-9 _ -` | `400 VALIDATION_FAILED`                                            |
+
+## Scope
+
+| Item              | Supported                                                                                           |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| Profile           | `quick` only: an unpaid read of your `402`, one paid request and one replay                          |
+| Methods           | `GET` and `POST` (JSON body)                                                                        |
+| Network           | Algorand Mainnet, CAIP-2 `algorand:wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=`                    |
+| Asset             | USDC, ASA `31566704`, `exact` scheme                                                                |
+| Facilitator       | GoPlausible, `https://facilitator.goplausible.xyz`                                                  |
+| Targets           | HTTPS on a public hostname and the default port. Private, loopback, link-local, CGNAT and metadata addresses are refused |
+
+A self-hosted Selo can run on Algorand Testnet instead (USDC ASA `10458941`), and the CLI accepts `--network testnet` for it. The public API runs on Mainnet only.
+
+## The CLI's own guard: `--max-usdc`
+
+`selo test` takes a per-run budget for what you pay Selo. It is checked against the price in Selo's live `402` before anything is signed.
+
+| Rule                                                 | Result                                                          |
+| ---------------------------------------------------- | --------------------------------------------------------------- |
+| Selo's price is above `--max-usdc`                   | Refused before signing, exit `3`                                 |
+| Selo's price is zero or above 5.00 USDC              | Refused before signing, exit `3`, whatever `--max-usdc` says    |
+| The `402` is on a network other than `--network`     | Refused before signing, exit `3`                                 |
+| The `402` names a payee other than `--pay-to`        | Refused before signing, exit `3`                                 |
+| `--network mainnet` without `--approve-mainnet` and `--pay-to` | Refused before any request, exit `3`                   |
+
+`--max-usdc 1.00` covers today's price. If Selo's price ever changes, the run stops before paying and you raise the budget deliberately. See [selo test](/cli/test).

@@ -1,0 +1,112 @@
+---
+title: "FAQ"
+description: "Short answers to the questions developers ask before they let Selo pay their x402 endpoint."
+icon: "circle-question"
+---
+
+<AccordionGroup>
+  <Accordion title="Why does Selo pay with real money instead of a mock?">
+    Because the failures that matter for a paid endpoint only appear when a real buyer pays. An endpoint can pass every health check and still:
+
+    - ask for the wrong asset, network or payee in its `402`;
+    - settle the payment and never deliver the paid resource;
+    - settle a second time, or repeat a paid side effect, when a request is retried;
+    - advertise a method, URL or price in its Bazaar listing that the live route no longer honours.
+
+    A mock never settles anything, so it cannot catch these. Selo makes one capped payment on Algorand Mainnet as a genuine x402 client, and both payments are public transactions you can check on an explorer. See [How Selo works](/how-it-works).
+  </Accordion>
+
+  <Accordion title="What does a release test cost?">
+    1.00 USDC per release test, paid by you to Selo over x402. Authorization and preflight are free. Selo pays your endpoint's price from its own wallet, up to 0.50 USDC per job, so that cost is not passed on to you. See [Pricing and limits](/resources/pricing-and-limits).
+  </Accordion>
+
+  <Accordion title="Will a test cause side effects on my endpoint?">
+    Possibly, because Selo really pays it. During a release test your endpoint receives one unpaid request to read the `402`, one paid request, and one replay of the identical signed payment and body. The preflight sends one more unpaid request. If your paid route creates orders, sends messages or charges anything, point Selo at a staging route or a test SKU.
+
+    Selo calls only the exact HTTPS URL and method you authorized, and every preflight and test request carries an `Idempotency-Key` header.
+  </Accordion>
+
+  <Accordion title="Can I use Selo against someone else's API?">
+    No. Selo refuses to test a route unless a verified, unexpired authorization covers its exact origin, route and method. To get one, the owner serves a one-time line at `/.well-known/selo-verification.txt` on that origin, or records explicit consent with Selo's operator. Consent is never inferred.
+
+    The authorization is checked again before the first request of a test and again before the replay. Selo also refuses private, loopback, link-local, CGNAT and metadata addresses, pins each connection to a vetted address, and never follows a redirect with a signed payment. See [Authorization](/concepts/authorization) and [Security model](/concepts/security).
+  </Accordion>
+
+  <Accordion title="Can Selo charge me twice?">
+    Not for one logical request. Selo claims the job by idempotency key before it settles your payment, so a duplicate or retried request is answered from the existing job and never settles again. Tests cover two different payments sent with the same `Idempotency-Key`: only one settles.
+
+    The `selo` CLI derives the key from the preflight and the payer, records every attempt before sending it, and never retries a payment on its own. If an outcome is unconfirmed, it refuses to pay again for that release until you rerun the same command with `--resume`, which reuses the same preflight and key.
+  </Accordion>
+
+  <Accordion title="What happens if a payment times out?">
+    It is held, never assumed to have failed.
+
+    - **Your payment to Selo.** If the facilitator does not confirm the outcome, Selo holds the job, answers `502 INBOUND_SETTLEMENT_UNRESOLVED`, tells you not to pay again, and does not run the job. The CLI records the attempt in `.selo/runs/<release>.json` and exits `2`. Rerun the same command with `--resume` to fetch the result. See [Recover an interrupted run](/guides/resume).
+    - **Selo's payment to your endpoint.** An ambiguous outcome moves the amount to `unresolved`, stops all further spending on the job, and ends the test INCONCLUSIVE with `PAYMENT_UNRESOLVED`. A timeout never frees the budget. Selo's operator resolves held downstream payments later from on-chain evidence only. See [Held payments and reconciliation](/concepts/reconciliation).
+  </Accordion>
+
+  <Accordion title="Is the verdict decided by AI?">
+    No. The verdict is deterministic code: a pure function in `packages/core/src/verdict.ts` that reduces the five check results. Any blocking FAIL with evidence gives FAIL. Otherwise, any blocking INCONCLUSIVE, missing check or check without evidence gives INCONCLUSIVE. Only then is the verdict PASS. The same check results always give the same verdict. See [Verdicts and the gate](/concepts/verdicts).
+  </Accordion>
+
+  <Accordion title="Can someone fake a PASS?">
+    Not in a way that opens the gate.
+
+    - The CLI does not trust the verdict label. It recomputes the verdict from the report's own checks with the same reducer Selo uses, and requires all five checks, both transactions and a report link before it exits `0`. A report that only says PASS exits `2`.
+    - Every verdict carries an Ed25519 attestation signed by Selo. `selo verify` checks it offline against keys you pinned, and refuses an attestation whose signed fields were changed, a key you do not trust, or a PASS for a different release, URL or method.
+
+    One limit: the release id is your own assertion. The attestation records it as `asserted_by_client`, and Selo does not check which build is deployed. See [Signed attestations](/concepts/attestations).
+  </Accordion>
+
+  <Accordion title="Why Algorand?">
+    Selo settles both payment legs in USDC (ASA `31566704`) on Algorand Mainnet through the GoPlausible x402 facilitator, and its handshake check verifies that your `402` offers an `exact` USDC payment on that network. Every payment is a public Algorand transaction, so anyone can check both legs of a test on an explorer such as `allo.info`. Other networks and assets are not supported today.
+  </Accordion>
+
+  <Accordion title="Does it work on Testnet?">
+    The public API at `https://api.useselo.xyz` runs on Mainnet only. You can run your own Selo on Algorand Testnet (USDC ASA `10458941`) from the [source code](https://github.com/Enoch208/selo), and point the CLI at it with `--network testnet`. A Testnet run does not need `--approve-mainnet`.
+  </Accordion>
+
+  <Accordion title="What does INCONCLUSIVE mean?">
+    Selo could not prove the release either way, so it refuses to call it PASS. It is never a pass, and the CLI exits `2`. The report names the reason:
+
+    | Reason                    | Meaning                                                              |
+    | ------------------------- | -------------------------------------------------------------------- |
+    | `NETWORK_UNAVAILABLE`     | A network call failed                                                |
+    | `FACILITATOR_UNAVAILABLE` | The facilitator or the Bazaar catalog could not be reached           |
+    | `TARGET_TIMEOUT`          | Your endpoint or the job's 60-second wall clock ran out of time      |
+    | `BUDGET_EXHAUSTED`        | The payment would exceed the job's spend limit                       |
+    | `PAYMENT_UNRESOLVED`      | A payment's outcome is unclear, so spending stopped                  |
+    | `EVIDENCE_INCOMPLETE`     | A check is missing, has no evidence, or could not be evaluated in full |
+    | `AUTHORIZATION_LAPSED`    | The authorization expired or stopped covering the route mid-run      |
+    | `INTERNAL_ERROR`          | Something failed on Selo's side                                      |
+
+    A failure on Selo's side is reported as INCONCLUSIVE, never as a FAIL of your endpoint. See [Errors and reason codes](/api-reference/errors).
+  </Accordion>
+
+  <Accordion title="Does a WARN block my release?">
+    No. A check with status `WARN` and evidence does not change the verdict. If nothing else fails or is inconclusive, the verdict is PASS and the CLI exits `0`. The warning is printed on a `warning` line and listed in the report's `warnings`. For example, a route that is not yet listed in the Bazaar catalog gets `discovery_contract` WARN `NOT_CATALOGED`.
+  </Accordion>
+
+  <Accordion title="My endpoint costs more than 0.50 USDC. Can I test it?">
+    Not on the public API. The preflight rejects a target priced above the per-job budget with `PRICE_OVER_BUDGET`, and the paid route refuses it before charging you. Test a route priced at 0.50 USDC or less.
+  </Accordion>
+
+  <Accordion title="Do I need the selo CLI?">
+    No. `POST /v1/release-test` answers with a standard x402 v2 `402`, and any x402 client that can pay USDC on Algorand can pay it. The CLI adds a fresh preflight, price and payee checks before signing, a stable `Idempotency-Key`, recovery with `--resume`, attestation saving and exit codes for CI. See [Pay with any x402 client](/guides/any-x402-client).
+  </Accordion>
+
+  <Accordion title="What data does Selo store, and who can read my report?">
+    Selo stores what it needs to run and prove the test:
+
+    - the authorization: origin, route, method, the project name and contact you gave, and a hash of the verification token (never the token itself);
+    - the preflight: the target URL, method, request body and your `402`'s payment terms;
+    - the job, its scenarios and every payment with its transaction id;
+    - sanitized evidence: response status, headers and a hash and size of the paid response body, plus a preview of up to 2,048 characters of it. Payment signatures, authorization headers, cookies and anything named like a secret are replaced by their SHA-256 before they are stored.
+
+    Your report sits behind an unguessable token link that Selo returns in the response to your paid request. Anyone who has the link can read it, so treat it like a password. It is served with `noindex`, `no-store` and `no-referrer`. The CLI redacts the link in terminal output and summaries and keeps the full link only in `.selo/runs/<release>.json`. The signed attestation holds no secret, request body or report token, so it is safe to share.
+  </Accordion>
+</AccordionGroup>
+
+## Still have a question?
+
+Open an issue at [github.com/Enoch208/selo/issues](https://github.com/Enoch208/selo/issues), or read [Known limitations](/resources/limitations).
